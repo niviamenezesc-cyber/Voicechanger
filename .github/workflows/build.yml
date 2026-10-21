@@ -10,33 +10,6 @@ jobs:
     steps:
       - name: Criar projeto Android
         run: |
-          cat > README.md <<'REA_EOF_X'
-          # Voice Changer (Android) - saída pelo alto-falante
-
-          ## Como compilar
-          1. Instale o Android Studio (versão recente).
-          2. File > Open > selecione a pasta VoiceChanger. Aguarde o Gradle sincronizar.
-          3. Conecte o celular (depuração USB ativada) e clique em Run, ou use Build > Build APK(s).
-
-          ## Como usar em ligações
-          - Melhor cenário: faça a ligação (WhatsApp, Instagram) em OUTRO aparelho, e deixe este
-            celular falando perto do microfone dele.
-          - Mesmo aparelho: o Android 10+ pode silenciar o microfone deste app enquanto o
-            WhatsApp/Instagram o estiver usando. Teste iniciando o app antes da ligação.
-            Mantenha o volume baixo para evitar microfonia (apito).
-
-          ## Estrutura
-          - PitchShifter.kt: troca de tom em tempo real (delay line com crossfade)
-          - VoiceEngine.kt: captura (AudioRecord), efeitos e saída (AudioTrack) com baixa latência
-          - VoiceService.kt: serviço em primeiro plano com notificação (exigido pelo Android)
-          - MainActivity.kt + activity_main.xml: interface (tom, robô, eco, volume)
-
-          ## Gerar o APK sem Android Studio (GitHub)
-          1. Crie um repositório no github.com e envie todos os arquivos desta pasta (inclusive .github).
-          2. Aba Actions > Build APK > Run workflow (ou aguarde o build automático após o envio).
-          3. Quando terminar (3 a 6 min), abra a execução e baixe o artefato "VoiceChanger-APK".
-          4. Extraia o zip, copie o app-debug.apk para o celular e instale (permita "fontes desconhecidas").
-          REA_EOF_X
           mkdir -p app
           cat > app/build.gradle.kts <<'REA_EOF_X'
           plugins {
@@ -45,11 +18,11 @@ jobs:
           }
 
           android {
-              namespace = "com.example.voicechanger"
+              namespace = "com.example.vozgrave"
               compileSdk = 34
 
               defaultConfig {
-                  applicationId = "com.example.voicechanger"
+                  applicationId = "com.example.vozgrave"
                   minSdk = 26
                   targetSdk = 34
                   versionCode = 1
@@ -73,12 +46,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
-                  android:label="Voice Changer"
+                  android:label="Voz Grave"
                   android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
                   <activity
@@ -90,126 +60,418 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <service
-                      android:name=".VoiceService"
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
                       android:exported="false"
-                      android:foregroundServiceType="microphone" />
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
               </application>
           </manifest>
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/voicechanger
-          cat > app/src/main/java/com/example/voicechanger/MainActivity.kt <<'REA_EOF_X'
-          package com.example.voicechanger
+          mkdir -p app/src/main/java/com/example/vozgrave
+          cat > app/src/main/java/com/example/vozgrave/LiveEngine.kt <<'REA_EOF_X'
+          package com.example.vozgrave
+
+          import android.annotation.SuppressLint
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import android.os.Process
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.pow
+          import kotlin.math.tanh
+
+          /** Modo ao vivo: microfone -> voz mais grave -> saída (use com fone para não ter eco). */
+          object LiveEngine {
+              private const val SR = 48000
+              private const val FRAME = 960
+              private const val HP_A = 0.985f
+              private const val LP_ALPHA = 0.34f
+              private const val GATE = 0.012f
+
+              @Volatile var semitonesDown = 4f
+              @Volatile var running = false
+              private var thread: Thread? = null
+
+              fun start() {
+                  if (running) return
+                  running = true
+                  thread = Thread({ loop() }, "live-engine").also { it.start() }
+              }
+
+              fun stop() {
+                  running = false
+                  thread?.join(700)
+                  thread = null
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun loop() {
+                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+                  val minIn = AudioRecord.getMinBufferSize(
+                      SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val rec = AudioRecord(
+                      MediaRecorder.AudioSource.MIC, SR,
+                      AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                      max(minIn, FRAME * 2 * 4)
+                  )
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      rec.release(); running = false; return
+                  }
+
+                  val minOut = AudioTrack.getMinBufferSize(
+                      SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val track = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder().setSampleRate(SR)
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
+                      )
+                      .setBufferSizeInBytes(max(minOut, FRAME * 2 * 4))
+                      .setTransferMode(AudioTrack.MODE_STREAM)
+                      .build()
+
+                  val shifter = PitchShifter(SR)
+                  val inBuf = ShortArray(FRAME)
+                  val outBuf = ShortArray(FRAME)
+                  var hpX = 0f; var hpY = 0f; var lp = 0f
+                  var env = 0f; var g = 0f
+
+                  try {
+                      val silence = ShortArray(FRAME)
+                      track.write(silence, 0, FRAME)
+                      track.write(silence, 0, FRAME)
+                      rec.startRecording()
+                      track.play()
+
+                      while (running) {
+                          val n = rec.read(inBuf, 0, FRAME)
+                          if (n <= 0) continue
+                          shifter.ratio = 2f.pow(-semitonesDown / 12f)
+
+                          for (i in 0 until n) {
+                              var x = inBuf[i] / 32768f
+                              val hp = HP_A * (hpY + x - hpX)
+                              hpX = x; hpY = hp
+                              lp += LP_ALPHA * (hp - lp)
+                              x = lp
+
+                              val ax = abs(x)
+                              env = if (ax > env) ax else env * 0.9995f
+                              val target = if (env > GATE) 1f else 0f
+                              g += (target - g) * (if (target > g) 0.02f else 0.0008f)
+                              x *= g
+
+                              x = shifter.process(x)
+                              x = tanh(x * 2f)
+                              outBuf[i] = (x * 32767f).toInt().toShort()
+                          }
+                          track.write(outBuf, 0, n)
+                      }
+                  } finally {
+                      runCatching { rec.stop() }
+                      runCatching { track.stop() }
+                      rec.release()
+                      track.release()
+                      running = false
+                  }
+              }
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/vozgrave
+          cat > app/src/main/java/com/example/vozgrave/MainActivity.kt <<'REA_EOF_X'
+          package com.example.vozgrave
 
           import android.Manifest
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
+          import android.media.MediaPlayer
           import android.os.Build
           import android.os.Bundle
+          import android.view.WindowManager
           import android.widget.Button
-          import android.widget.CheckBox
           import android.widget.SeekBar
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
           import androidx.appcompat.app.AppCompatActivity
           import androidx.core.content.ContextCompat
+          import androidx.core.content.FileProvider
+          import java.io.File
 
           class MainActivity : AppCompatActivity() {
 
-              private lateinit var btnToggle: Button
-              private lateinit var seekPitch: SeekBar
-              private lateinit var txtPitch: TextView
+              private lateinit var btnRecord: Button
+              private lateinit var btnPlay: Button
+              private lateinit var btnShare: Button
+              private lateinit var btnApply: Button
+              private lateinit var btnLive: Button
+              private lateinit var seekGrave: SeekBar
+              private lateinit var txtGrave: TextView
+              private lateinit var txtStatus: TextView
+
+              private val recorder = Recorder()
+              private var raw: ShortArray? = null
+              private var player: MediaPlayer? = null
+              private var recording = false
+              private var hasResult = false
+              private lateinit var outFile: File
+              private var pendingAction: (() -> Unit)? = null
 
               private val permLauncher =
-                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
-                      if (r[Manifest.permission.RECORD_AUDIO] == true) startVoice()
-                      else Toast.makeText(this, "Permissão do microfone é necessária", Toast.LENGTH_LONG).show()
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                      if (granted) pendingAction?.invoke()
+                      else Toast.makeText(this, "A permissão do microfone é necessária", Toast.LENGTH_LONG).show()
+                      pendingAction = null
                   }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContentView(R.layout.activity_main)
+                  outFile = File(cacheDir, "voz_grave.wav")
 
-                  btnToggle = findViewById(R.id.btnToggle)
-                  seekPitch = findViewById(R.id.seekPitch)
-                  txtPitch = findViewById(R.id.txtPitch)
+                  btnRecord = findViewById(R.id.btnRecord)
+                  btnPlay = findViewById(R.id.btnPlay)
+                  btnShare = findViewById(R.id.btnShare)
+                  btnApply = findViewById(R.id.btnApply)
+                  btnLive = findViewById(R.id.btnLive)
+                  seekGrave = findViewById(R.id.seekGrave)
+                  txtGrave = findViewById(R.id.txtGrave)
+                  txtStatus = findViewById(R.id.txtStatus)
 
-                  btnToggle.setOnClickListener {
-                      if (VoiceEngine.running) stopVoice() else requestAndStart()
-                  }
+                  updateGraveText()
+                  refreshButtons()
 
-                  // Tom: -12..+12 semitons (seek 0..24)
-                  seekPitch.setOnSeekBarChangeListener(simpleListener { p ->
-                      setPitch(p - 12)
+                  seekGrave.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          updateGraveText()
+                          LiveEngine.semitonesDown = semitones().toFloat()
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
                   })
-                  setPitch(0)
 
-                  findViewById<SeekBar>(R.id.seekVolume).setOnSeekBarChangeListener(simpleListener { p ->
-                      VoiceEngine.volume = p / 100f
-                  })
-                  findViewById<CheckBox>(R.id.chkRobot).setOnCheckedChangeListener { _, c -> VoiceEngine.robot = c }
-                  findViewById<CheckBox>(R.id.chkEcho).setOnCheckedChangeListener { _, c -> VoiceEngine.echo = c }
-
-                  // Presets rápidos
-                  findViewById<Button>(R.id.btnNormal).setOnClickListener { seekPitch.progress = 12 }
-                  findViewById<Button>(R.id.btnDeep).setOnClickListener { seekPitch.progress = 12 - 5 }
-                  findViewById<Button>(R.id.btnHigh).setOnClickListener { seekPitch.progress = 12 + 5 }
-                  findViewById<Button>(R.id.btnKid).setOnClickListener { seekPitch.progress = 12 + 9 }
+                  btnRecord.setOnClickListener { toggleRecord() }
+                  btnPlay.setOnClickListener { togglePlay() }
+                  btnShare.setOnClickListener { share() }
+                  btnApply.setOnClickListener { convert() }
+                  btnLive.setOnClickListener { toggleLive() }
               }
 
-              override fun onResume() {
-                  super.onResume()
-                  updateButton()
+              override fun onStop() {
+                  super.onStop()
+                  if (LiveEngine.running) stopLive()
+                  stopPlayer()
               }
 
-              private fun setPitch(semitones: Int) {
-                  VoiceEngine.semitones = semitones.toFloat()
-                  txtPitch.text = "Tom: ${if (semitones > 0) "+" else ""}$semitones semitons"
+              override fun onDestroy() {
+                  stopPlayer()
+                  super.onDestroy()
               }
 
-              private fun requestAndStart() {
-                  val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
-                  if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
-                  val missing = perms.filter {
-                      ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+              private fun semitones(): Int = seekGrave.progress + 1
+
+              private fun updateGraveText() {
+                  txtGrave.text = "Quão grave: ${semitones()} semitons"
+              }
+
+              private fun setStatus(s: String) {
+                  txtStatus.text = s
+              }
+
+              private fun refreshButtons() {
+                  btnPlay.isEnabled = hasResult
+                  btnShare.isEnabled = hasResult
+                  btnApply.isEnabled = raw != null
+              }
+
+              private fun withMic(action: () -> Unit) {
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                      == PackageManager.PERMISSION_GRANTED
+                  ) {
+                      action()
+                  } else {
+                      pendingAction = action
+                      permLauncher.launch(Manifest.permission.RECORD_AUDIO)
                   }
-                  if (missing.isEmpty()) startVoice() else permLauncher.launch(missing.toTypedArray())
               }
 
-              private fun startVoice() {
-                  ContextCompat.startForegroundService(this, Intent(this, VoiceService::class.java))
-                  btnToggle.postDelayed({ updateButton() }, 300)
+              // ---------- Gravar e converter ----------
+
+              private fun toggleRecord() {
+                  if (!recording) {
+                      withMic {
+                          stopPlayer()
+                          if (recorder.start()) {
+                              recording = true
+                              btnRecord.text = "PARAR GRAVAÇÃO"
+                              setStatus("Gravando... fale normalmente.")
+                          } else {
+                              setStatus("Não foi possível usar o microfone.")
+                          }
+                      }
+                  } else {
+                      recording = false
+                      btnRecord.text = "GRAVAR"
+                      raw = recorder.stop()
+                      convert()
+                  }
               }
 
-              private fun stopVoice() {
-                  startService(Intent(this, VoiceService::class.java).setAction(VoiceService.ACTION_STOP))
-                  btnToggle.postDelayed({ updateButton() }, 300)
+              private fun convert() {
+                  val data = raw ?: return
+                  if (data.size < 4410) {
+                      setStatus("Gravação muito curta. Grave de novo.")
+                      return
+                  }
+                  stopPlayer()
+                  setStatus("Processando... aguarde.")
+                  btnRecord.isEnabled = false
+                  btnApply.isEnabled = false
+                  btnPlay.isEnabled = false
+                  btnShare.isEnabled = false
+                  val st = semitones().toFloat()
+                  Thread {
+                      val out = try {
+                          VoiceDeepener.process(data, st)
+                      } catch (e: Throwable) {
+                          null
+                      }
+                      if (out != null) WavWriter.write(outFile, out, Recorder.SR)
+                      runOnUiThread {
+                          hasResult = out != null
+                          btnRecord.isEnabled = true
+                          setStatus(
+                              if (out != null) "Pronto! Toque em OUVIR ou COMPARTILHAR."
+                              else "Erro ao processar. Tente uma gravação mais curta."
+                          )
+                          refreshButtons()
+                      }
+                  }.start()
               }
 
-              private fun updateButton() {
-                  btnToggle.text = if (VoiceEngine.running) "PARAR" else "INICIAR"
+              private fun togglePlay() {
+                  if (player != null) {
+                      stopPlayer()
+                      return
+                  }
+                  try {
+                      player = MediaPlayer().apply {
+                          setDataSource(outFile.absolutePath)
+                          setOnCompletionListener { stopPlayer() }
+                          prepare()
+                          start()
+                      }
+                      btnPlay.text = "PARAR"
+                  } catch (e: Exception) {
+                      stopPlayer()
+                      setStatus("Não foi possível tocar o áudio.")
+                  }
               }
 
-              private fun simpleListener(onChange: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
-                  override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) = onChange(p)
-                  override fun onStartTrackingTouch(s: SeekBar?) {}
-                  override fun onStopTrackingTouch(s: SeekBar?) {}
+              private fun stopPlayer() {
+                  player?.let {
+                      runCatching { it.stop() }
+                      it.release()
+                  }
+                  player = null
+                  if (::btnPlay.isInitialized) btnPlay.text = "OUVIR"
+              }
+
+              private fun share() {
+                  val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", outFile)
+                  val i = Intent(Intent.ACTION_SEND).apply {
+                      type = "audio/wav"
+                      putExtra(Intent.EXTRA_STREAM, uri)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  }
+                  startActivity(Intent.createChooser(i, "Enviar áudio por"))
+              }
+
+              // ---------- Ao vivo (com fone) ----------
+
+              private fun toggleLive() {
+                  if (LiveEngine.running) {
+                      stopLive()
+                      return
+                  }
+                  withMic {
+                      if (!hasHeadset()) {
+                          AlertDialog.Builder(this)
+                              .setTitle("Conecte um fone")
+                              .setMessage(
+                                  "Sem fone, o alto-falante entra no microfone e causa eco alto. " +
+                                      "Conecte um fone (com fio, USB-C ou Bluetooth) e toque em INICIAR de novo."
+                              )
+                              .setPositiveButton("OK", null)
+                              .show()
+                      } else {
+                          startLive()
+                      }
+                  }
+              }
+
+              private fun startLive() {
+                  LiveEngine.semitonesDown = semitones().toFloat()
+                  LiveEngine.start()
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  btnLive.text = "PARAR AO VIVO"
+                  setStatus("Ao vivo ligado. Fale: a voz grave sai no fone.")
+                  btnLive.postDelayed({
+                      if (!LiveEngine.running) stopLive()
+                  }, 800)
+              }
+
+              private fun stopLive() {
+                  LiveEngine.stop()
+                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  btnLive.text = "INICIAR AO VIVO"
+                  setStatus("Ao vivo desligado.")
+              }
+
+              private fun hasHeadset(): Boolean {
+                  val am = getSystemService(AudioManager::class.java)
+                  val ok = mutableListOf(
+                      AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                      AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                      AudioDeviceInfo.TYPE_USB_HEADSET,
+                      AudioDeviceInfo.TYPE_USB_DEVICE,
+                      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                  )
+                  if (Build.VERSION.SDK_INT >= 31) ok.add(AudioDeviceInfo.TYPE_BLE_HEADSET)
+                  return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { it.type in ok }
               }
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/voicechanger
-          cat > app/src/main/java/com/example/voicechanger/PitchShifter.kt <<'REA_EOF_X'
-          package com.example.voicechanger
+          mkdir -p app/src/main/java/com/example/vozgrave
+          cat > app/src/main/java/com/example/vozgrave/PitchShifter.kt <<'REA_EOF_X'
+          package com.example.vozgrave
 
           import kotlin.math.abs
 
           /**
-           * Pitch shifter de baixa latência (delay line com dois "taps" e crossfade triangular).
-           * ratio > 1 = voz mais aguda, ratio < 1 = voz mais grave.
-           * Latência: cerca de windowMs/2.
+           * Troca de tom em tempo real (delay line com dois "taps" e crossfade triangular).
+           * ratio < 1 = voz mais grave.
            */
-          class PitchShifter(sampleRate: Int, windowMs: Int = 40) {
+          class PitchShifter(sampleRate: Int, windowMs: Int = 50) {
               private val w = sampleRate * windowMs / 1000
               private val buf = FloatArray(w * 4)
               private var wp = 0
@@ -240,191 +502,197 @@ jobs:
               private fun gain(p: Float) = 1f - abs(2f * p - 1f)
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/voicechanger
-          cat > app/src/main/java/com/example/voicechanger/VoiceEngine.kt <<'REA_EOF_X'
-          package com.example.voicechanger
+          mkdir -p app/src/main/java/com/example/vozgrave
+          cat > app/src/main/java/com/example/vozgrave/Recorder.kt <<'REA_EOF_X'
+          package com.example.vozgrave
 
           import android.annotation.SuppressLint
-          import android.content.Context
-          import android.media.AudioAttributes
-          import android.media.AudioDeviceInfo
           import android.media.AudioFormat
-          import android.media.AudioManager
           import android.media.AudioRecord
-          import android.media.AudioTrack
           import android.media.MediaRecorder
-          import kotlin.math.PI
-          import kotlin.math.abs
           import kotlin.math.max
-          import kotlin.math.pow
-          import kotlin.math.sin
-          import kotlin.math.tanh
 
-          /** Captura o microfone, aplica o efeito e toca no alto-falante, tudo em tempo real. */
-          object VoiceEngine {
-              const val SR = 44100
-              private const val FRAME = 512 // ~11,6 ms por bloco
+          /** Grava o microfone em memória (mono, 16 bits, 44,1 kHz). Limite: 5 minutos. */
+          class Recorder {
+              companion object {
+                  const val SR = 44100
+              }
 
-              @Volatile var semitones = 0f
-              @Volatile var robot = false
-              @Volatile var echo = false
-              @Volatile var volume = 1.0f
-              @Volatile var running = false
+              @Volatile private var recording = false
               private var thread: Thread? = null
-
-              fun start(ctx: Context) {
-                  if (running) return
-                  running = true
-                  val app = ctx.applicationContext
-                  thread = Thread({ loop(app) }, "voice-engine").also {
-                      it.priority = Thread.MAX_PRIORITY
-                      it.start()
-                  }
-              }
-
-              fun stop() {
-                  running = false
-                  thread?.join(700)
-                  thread = null
-              }
+              private var data = ShortArray(SR * 10)
+              private var len = 0
 
               @SuppressLint("MissingPermission")
-              private fun loop(ctx: Context) {
-                  val minIn = AudioRecord.getMinBufferSize(
+              fun start(): Boolean {
+                  val minBuf = AudioRecord.getMinBufferSize(
                       SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
                   )
-                  // VOICE_COMMUNICATION ativa cancelamento de eco/ruído do sistema, ajudando contra microfonia.
+                  if (minBuf <= 0) return false
                   val rec = AudioRecord(
-                      MediaRecorder.AudioSource.VOICE_COMMUNICATION, SR,
+                      MediaRecorder.AudioSource.MIC, SR,
                       AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                      max(minIn, FRAME * 4)
+                      max(minBuf, SR)
                   )
                   if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                      rec.release(); running = false; return
-                  }
-
-                  val minOut = AudioTrack.getMinBufferSize(
-                      SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-                  )
-                  val track = AudioTrack.Builder()
-                      .setAudioAttributes(
-                          AudioAttributes.Builder()
-                              .setUsage(AudioAttributes.USAGE_MEDIA)
-                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-                      )
-                      .setAudioFormat(
-                          AudioFormat.Builder().setSampleRate(SR)
-                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
-                      )
-                      .setBufferSizeInBytes(max(minOut, FRAME * 4))
-                      .setTransferMode(AudioTrack.MODE_STREAM)
-                      .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                      .build()
-
-                  // Força a saída no alto-falante do aparelho.
-                  val am = ctx.getSystemService(AudioManager::class.java)
-                  am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                      .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                      ?.let { track.preferredDevice = it }
-
-                  val shifter = PitchShifter(SR)
-                  val echoBuf = FloatArray(SR / 4) // eco de 250 ms
-                  var ep = 0
-                  var robotPhase = 0.0
-                  val inBuf = ShortArray(FRAME)
-                  val outBuf = ShortArray(FRAME)
-
-                  try {
-                      rec.startRecording()
-                      track.play()
-                      while (running) {
-                          val n = rec.read(inBuf, 0, FRAME)
-                          if (n <= 0) continue
-                          val st = semitones
-                          shifter.ratio = 2f.pow(st / 12f)
-                          for (i in 0 until n) {
-                              var x = inBuf[i] / 32768f
-                              if (abs(st) >= 0.05f) x = shifter.process(x)
-                              if (robot) {
-                                  x *= sin(2.0 * PI * robotPhase).toFloat() * 1.4f
-                                  robotPhase += 50.0 / SR
-                                  if (robotPhase >= 1.0) robotPhase -= 1.0
-                              }
-                              if (echo) {
-                                  x += echoBuf[ep] * 0.4f
-                                  echoBuf[ep] = x
-                                  ep = (ep + 1) % echoBuf.size
-                              }
-                              x = tanh(x * volume) // limitador suave, evita estouro
-                              outBuf[i] = (x * 32767f).toInt().toShort()
-                          }
-                          track.write(outBuf, 0, n)
-                      }
-                  } finally {
-                      runCatching { rec.stop() }
-                      runCatching { track.stop() }
                       rec.release()
-                      track.release()
-                      running = false
+                      return false
                   }
+                  len = 0
+                  recording = true
+                  thread = Thread {
+                      val buf = ShortArray(2048)
+                      rec.startRecording()
+                      while (recording && len < SR * 300) {
+                          val n = rec.read(buf, 0, buf.size)
+                          if (n > 0) {
+                              ensure(n)
+                              System.arraycopy(buf, 0, data, len, n)
+                              len += n
+                          } else if (n < 0) break
+                      }
+                      runCatching { rec.stop() }
+                      rec.release()
+                  }.also { it.start() }
+                  return true
+              }
+
+              fun stop(): ShortArray {
+                  recording = false
+                  thread?.join()
+                  thread = null
+                  return data.copyOf(len)
+              }
+
+              private fun ensure(n: Int) {
+                  if (len + n > data.size) data = data.copyOf(max(data.size * 2, len + n))
               }
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/voicechanger
-          cat > app/src/main/java/com/example/voicechanger/VoiceService.kt <<'REA_EOF_X'
-          package com.example.voicechanger
+          mkdir -p app/src/main/java/com/example/vozgrave
+          cat > app/src/main/java/com/example/vozgrave/VoiceDeepener.kt <<'REA_EOF_X'
+          package com.example.vozgrave
 
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.Service
-          import android.content.Intent
-          import android.content.pm.ServiceInfo
-          import android.os.Build
-          import android.os.IBinder
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.sqrt
 
-          /** Mantém o motor de voz vivo em segundo plano (obrigatório para usar o microfone fora da tela). */
-          class VoiceService : Service() {
+          /**
+           * Deixa a voz mais grave mantendo a duração (processamento offline, melhor qualidade).
+           * 1) Comprime o tempo com WSOLA (sem mudar o tom).
+           * 2) Reproduz mais devagar (reamostragem), o que baixa o tom e devolve a duração original.
+           */
+          object VoiceDeepener {
 
-              override fun onBind(intent: Intent?): IBinder? = null
+              fun process(input: ShortArray, semitonesDown: Float): ShortArray {
+                  val r = 2.0.pow(-semitonesDown / 12.0) // < 1
+                  val x = FloatArray(input.size) { input[it] / 32768f }
+                  val compressed = wsola(x, r)
+                  val out = resample(compressed, r)
 
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  if (intent?.action == ACTION_STOP) {
-                      VoiceEngine.stop()
-                      stopForeground(STOP_FOREGROUND_REMOVE)
-                      stopSelf()
-                      return START_NOT_STICKY
+                  var peak = 0f
+                  for (v in out) {
+                      val a = abs(v)
+                      if (a > peak) peak = a
                   }
-
-                  val nm = getSystemService(NotificationManager::class.java)
-                  nm.createNotificationChannel(
-                      NotificationChannel(CHANNEL, "Voice Changer", NotificationManager.IMPORTANCE_LOW)
-                  )
-                  val notification = Notification.Builder(this, CHANNEL)
-                      .setContentTitle("Voice Changer ativo")
-                      .setContentText("Sua voz está sendo modificada em tempo real")
-                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                      .setOngoing(true)
-                      .build()
-
-                  if (Build.VERSION.SDK_INT >= 29) {
-                      startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-                  } else {
-                      startForeground(1, notification)
+                  val gain = if (peak > 0.0001f) min(0.9f / peak, 3f) else 1f
+                  return ShortArray(out.size) {
+                      (out[it] * gain * 32767f).coerceIn(-32768f, 32767f).toInt().toShort()
                   }
-                  VoiceEngine.start(this)
-                  return START_NOT_STICKY
               }
 
-              override fun onDestroy() {
-                  VoiceEngine.stop()
-                  super.onDestroy()
+              private fun wsola(x: FloatArray, alpha: Double): FloatArray {
+                  val n = 2048
+                  val hs = n / 2
+                  val delta = 512
+                  val ha = hs / alpha
+                  val targetLen = (x.size * alpha).toInt()
+                  val xp = FloatArray(x.size + 4 * n)
+                  System.arraycopy(x, 0, xp, 0, x.size)
+                  val out = FloatArray(targetLen + 2 * n)
+                  val win = FloatArray(n) { (0.5 - 0.5 * cos(2.0 * PI * it / n)).toFloat() }
+
+                  // primeiro quadro: metade inicial sem janela para não ter "fade-in"
+                  for (i in 0 until hs) out[i] += xp[i]
+                  for (i in hs until n) out[i] += win[i] * xp[i]
+
+                  var prev = 0
+                  var k = 1
+                  while (true) {
+                      val nominal = (k * ha).toInt()
+                      if (nominal >= x.size || k * hs + n > out.size) break
+                      val tpl = prev + hs
+                      val lo = max(0, nominal - delta)
+                      val hi = nominal + delta
+                      var best = lo
+                      var bestScore = -Float.MAX_VALUE
+                      var c = lo
+                      while (c <= hi) {
+                          var dot = 0f
+                          var en = 1e-6f
+                          var i = 0
+                          while (i < hs) {
+                              val a = xp[c + i]
+                              dot += a * xp[tpl + i]
+                              en += a * a
+                              i += 4
+                          }
+                          val score = dot / sqrt(en)
+                          if (score > bestScore) {
+                              bestScore = score
+                              best = c
+                          }
+                          c += 2
+                      }
+                      val base = k * hs
+                      for (i in 0 until n) out[base + i] += win[i] * xp[best + i]
+                      prev = best
+                      k++
+                  }
+                  return out.copyOf(targetLen)
               }
 
-              companion object {
-                  const val ACTION_STOP = "com.example.voicechanger.STOP"
-                  private const val CHANNEL = "voice_changer"
+              private fun resample(x: FloatArray, step: Double): FloatArray {
+                  val len = (x.size / step).toInt()
+                  val out = FloatArray(len)
+                  for (i in 0 until len) {
+                      val pos = i * step
+                      val j = pos.toInt()
+                      val f = (pos - j).toFloat()
+                      val a = x[j]
+                      val b = if (j + 1 < x.size) x[j + 1] else a
+                      out[i] = a + (b - a) * f
+                  }
+                  return out
+              }
+          }
+
+          object WavWriter {
+              fun write(file: File, pcm: ShortArray, sampleRate: Int) {
+                  val bytes = pcm.size * 2
+                  val bb = ByteBuffer.allocate(44 + bytes).order(ByteOrder.LITTLE_ENDIAN)
+                  bb.put("RIFF".toByteArray())
+                  bb.putInt(36 + bytes)
+                  bb.put("WAVE".toByteArray())
+                  bb.put("fmt ".toByteArray())
+                  bb.putInt(16)
+                  bb.putShort(1)   // PCM
+                  bb.putShort(1)   // mono
+                  bb.putInt(sampleRate)
+                  bb.putInt(sampleRate * 2)
+                  bb.putShort(2)
+                  bb.putShort(16)
+                  bb.put("data".toByteArray())
+                  bb.putInt(bytes)
+                  for (s in pcm) bb.putShort(s)
+                  file.writeBytes(bb.array())
               }
           }
           REA_EOF_X
@@ -445,77 +713,98 @@ jobs:
                   <TextView
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:text="Voice Changer"
+                      android:text="Voz Grave"
                       android:textSize="28sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/txtGrave"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="Quão grave: 4 semitons"
+                      android:textSize="16sp" />
+
+                  <SeekBar
+                      android:id="@+id/seekGrave"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:max="11"
+                      android:progress="3" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="1) Gravar e converter"
+                      android:textSize="18sp"
                       android:textStyle="bold" />
 
                   <TextView
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="8dp"
-                      android:text="A saída toca no alto-falante. Use outro aparelho na ligação, ou o mesmo aparelho com o volume baixo, para evitar microfonia." />
+                      android:text="Grave, ouça o resultado e envie o áudio pelo WhatsApp ou Telegram." />
 
                   <Button
-                      android:id="@+id/btnToggle"
+                      android:id="@+id/btnRecord"
                       android:layout_width="match_parent"
-                      android:layout_height="64dp"
-                      android:layout_marginTop="24dp"
-                      android:text="INICIAR"
-                      android:textSize="18sp" />
+                      android:layout_height="60dp"
+                      android:layout_marginTop="8dp"
+                      android:text="GRAVAR" />
 
-                  <LinearLayout
+                  <Button
+                      android:id="@+id/btnPlay"
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="24dp"
-                      android:orientation="horizontal">
+                      android:text="OUVIR" />
 
-                      <Button android:id="@+id/btnNormal" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Normal" />
-                      <Button android:id="@+id/btnDeep" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Grave" />
-                      <Button android:id="@+id/btnHigh" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Agudo" />
-                      <Button android:id="@+id/btnKid" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Criança" />
-                  </LinearLayout>
+                  <Button
+                      android:id="@+id/btnShare"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="COMPARTILHAR" />
+
+                  <Button
+                      android:id="@+id/btnApply"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="CONVERTER DE NOVO COM O GRAU ATUAL" />
 
                   <TextView
-                      android:id="@+id/txtPitch"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:text="Tom: 0 semitons" />
-
-                  <SeekBar
-                      android:id="@+id/seekPitch"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:max="24"
-                      android:progress="12" />
-
-                  <CheckBox
-                      android:id="@+id/chkRobot"
+                      android:id="@+id/txtStatus"
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
                       android:layout_marginTop="8dp"
-                      android:text="Efeito robô" />
-
-                  <CheckBox
-                      android:id="@+id/chkEcho"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:text="Eco" />
+                      android:text="Pronto para gravar." />
 
                   <TextView
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:text="Volume de saída" />
+                      android:layout_marginTop="32dp"
+                      android:text="2) Ao vivo (somente com fone)"
+                      android:textSize="18sp"
+                      android:textStyle="bold" />
 
-                  <SeekBar
-                      android:id="@+id/seekVolume"
+                  <TextView
                       android:layout_width="match_parent"
                       android:layout_height="wrap_content"
-                      android:max="200"
-                      android:progress="100" />
+                      android:text="Para ligações em outro aparelho: conecte um fone neste celular e encoste um dos lados no microfone do aparelho da ligação. Neste mesmo celular, o Android não deixa o app entrar na ligação do WhatsApp, Telegram ou Instagram." />
+
+                  <Button
+                      android:id="@+id/btnLive"
+                      android:layout_width="match_parent"
+                      android:layout_height="60dp"
+                      android:layout_marginTop="8dp"
+                      android:text="INICIAR AO VIVO" />
               </LinearLayout>
           </ScrollView>
+          REA_EOF_X
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'REA_EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="audio" path="." />
+          </paths>
           REA_EOF_X
           cat > build.gradle.kts <<'REA_EOF_X'
           plugins {
@@ -535,7 +824,7 @@ jobs:
           dependencyResolutionManagement {
               repositories { google(); mavenCentral() }
           }
-          rootProject.name = "VoiceChanger"
+          rootProject.name = "VozGrave"
           include(":app")
           REA_EOF_X
       - uses: actions/setup-java@v4
@@ -550,11 +839,12 @@ jobs:
       - name: Guardar APK
         uses: actions/upload-artifact@v4
         with:
-          name: VoiceChanger-APK
+          name: VozGrave-APK
           path: app/build/outputs/apk/debug/app-debug.apk
       - name: Publicar APK em Releases
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk VoiceChanger.apk
-          gh release create "apk-${{ github.run_number }}" VoiceChanger.apk --title "Voice Changer APK #${{ github.run_number }}" --notes "APK de teste (debug)."
+          cp app/build/outputs/apk/debug/app-debug.apk VozGrave.apk
+          gh release create "vozgrave-${{ github.run_number }}" VozGrave.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Voz Grave APK #${{ github.run_number }}" --notes "APK de teste (debug)."
