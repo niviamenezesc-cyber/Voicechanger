@@ -1,0 +1,560 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar projeto Android
+        run: |
+          cat > README.md <<'REA_EOF_X'
+          # Voice Changer (Android) - saída pelo alto-falante
+
+          ## Como compilar
+          1. Instale o Android Studio (versão recente).
+          2. File > Open > selecione a pasta VoiceChanger. Aguarde o Gradle sincronizar.
+          3. Conecte o celular (depuração USB ativada) e clique em Run, ou use Build > Build APK(s).
+
+          ## Como usar em ligações
+          - Melhor cenário: faça a ligação (WhatsApp, Instagram) em OUTRO aparelho, e deixe este
+            celular falando perto do microfone dele.
+          - Mesmo aparelho: o Android 10+ pode silenciar o microfone deste app enquanto o
+            WhatsApp/Instagram o estiver usando. Teste iniciando o app antes da ligação.
+            Mantenha o volume baixo para evitar microfonia (apito).
+
+          ## Estrutura
+          - PitchShifter.kt: troca de tom em tempo real (delay line com crossfade)
+          - VoiceEngine.kt: captura (AudioRecord), efeitos e saída (AudioTrack) com baixa latência
+          - VoiceService.kt: serviço em primeiro plano com notificação (exigido pelo Android)
+          - MainActivity.kt + activity_main.xml: interface (tom, robô, eco, volume)
+
+          ## Gerar o APK sem Android Studio (GitHub)
+          1. Crie um repositório no github.com e envie todos os arquivos desta pasta (inclusive .github).
+          2. Aba Actions > Build APK > Run workflow (ou aguarde o build automático após o envio).
+          3. Quando terminar (3 a 6 min), abra a execução e baixe o artefato "VoiceChanger-APK".
+          4. Extraia o zip, copie o app-debug.apk para o celular e instale (permita "fontes desconhecidas").
+          REA_EOF_X
+          mkdir -p app
+          cat > app/build.gradle.kts <<'REA_EOF_X'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.voicechanger"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.voicechanger"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          REA_EOF_X
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'REA_EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Voice Changer"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".VoiceService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/voicechanger
+          cat > app/src/main/java/com/example/voicechanger/MainActivity.kt <<'REA_EOF_X'
+          package com.example.voicechanger
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var btnToggle: Button
+              private lateinit var seekPitch: SeekBar
+              private lateinit var txtPitch: TextView
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+                      if (r[Manifest.permission.RECORD_AUDIO] == true) startVoice()
+                      else Toast.makeText(this, "Permissão do microfone é necessária", Toast.LENGTH_LONG).show()
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  btnToggle = findViewById(R.id.btnToggle)
+                  seekPitch = findViewById(R.id.seekPitch)
+                  txtPitch = findViewById(R.id.txtPitch)
+
+                  btnToggle.setOnClickListener {
+                      if (VoiceEngine.running) stopVoice() else requestAndStart()
+                  }
+
+                  // Tom: -12..+12 semitons (seek 0..24)
+                  seekPitch.setOnSeekBarChangeListener(simpleListener { p ->
+                      setPitch(p - 12)
+                  })
+                  setPitch(0)
+
+                  findViewById<SeekBar>(R.id.seekVolume).setOnSeekBarChangeListener(simpleListener { p ->
+                      VoiceEngine.volume = p / 100f
+                  })
+                  findViewById<CheckBox>(R.id.chkRobot).setOnCheckedChangeListener { _, c -> VoiceEngine.robot = c }
+                  findViewById<CheckBox>(R.id.chkEcho).setOnCheckedChangeListener { _, c -> VoiceEngine.echo = c }
+
+                  // Presets rápidos
+                  findViewById<Button>(R.id.btnNormal).setOnClickListener { seekPitch.progress = 12 }
+                  findViewById<Button>(R.id.btnDeep).setOnClickListener { seekPitch.progress = 12 - 5 }
+                  findViewById<Button>(R.id.btnHigh).setOnClickListener { seekPitch.progress = 12 + 5 }
+                  findViewById<Button>(R.id.btnKid).setOnClickListener { seekPitch.progress = 12 + 9 }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateButton()
+              }
+
+              private fun setPitch(semitones: Int) {
+                  VoiceEngine.semitones = semitones.toFloat()
+                  txtPitch.text = "Tom: ${if (semitones > 0) "+" else ""}$semitones semitons"
+              }
+
+              private fun requestAndStart() {
+                  val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
+                  val missing = perms.filter {
+                      ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+                  }
+                  if (missing.isEmpty()) startVoice() else permLauncher.launch(missing.toTypedArray())
+              }
+
+              private fun startVoice() {
+                  ContextCompat.startForegroundService(this, Intent(this, VoiceService::class.java))
+                  btnToggle.postDelayed({ updateButton() }, 300)
+              }
+
+              private fun stopVoice() {
+                  startService(Intent(this, VoiceService::class.java).setAction(VoiceService.ACTION_STOP))
+                  btnToggle.postDelayed({ updateButton() }, 300)
+              }
+
+              private fun updateButton() {
+                  btnToggle.text = if (VoiceEngine.running) "PARAR" else "INICIAR"
+              }
+
+              private fun simpleListener(onChange: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
+                  override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) = onChange(p)
+                  override fun onStartTrackingTouch(s: SeekBar?) {}
+                  override fun onStopTrackingTouch(s: SeekBar?) {}
+              }
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/voicechanger
+          cat > app/src/main/java/com/example/voicechanger/PitchShifter.kt <<'REA_EOF_X'
+          package com.example.voicechanger
+
+          import kotlin.math.abs
+
+          /**
+           * Pitch shifter de baixa latência (delay line com dois "taps" e crossfade triangular).
+           * ratio > 1 = voz mais aguda, ratio < 1 = voz mais grave.
+           * Latência: cerca de windowMs/2.
+           */
+          class PitchShifter(sampleRate: Int, windowMs: Int = 40) {
+              private val w = sampleRate * windowMs / 1000
+              private val buf = FloatArray(w * 4)
+              private var wp = 0
+              private var phase = 0f
+              var ratio = 1f
+
+              fun process(x: Float): Float {
+                  buf[wp] = x
+                  phase += (1f - ratio) / w
+                  if (phase >= 1f) phase -= 1f
+                  if (phase < 0f) phase += 1f
+                  val p2 = (phase + 0.5f) % 1f
+                  val y = tap(phase) * gain(phase) + tap(p2) * gain(p2)
+                  wp = (wp + 1) % buf.size
+                  return y
+              }
+
+              private fun tap(p: Float): Float {
+                  var pos = wp - (p * w + 1f)
+                  if (pos < 0f) pos += buf.size
+                  val i = pos.toInt()
+                  val f = pos - i
+                  val a = buf[i % buf.size]
+                  val b = buf[(i + 1) % buf.size]
+                  return a + (b - a) * f
+              }
+
+              private fun gain(p: Float) = 1f - abs(2f * p - 1f)
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/voicechanger
+          cat > app/src/main/java/com/example/voicechanger/VoiceEngine.kt <<'REA_EOF_X'
+          package com.example.voicechanger
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioDeviceInfo
+          import android.media.AudioFormat
+          import android.media.AudioManager
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.math.tanh
+
+          /** Captura o microfone, aplica o efeito e toca no alto-falante, tudo em tempo real. */
+          object VoiceEngine {
+              const val SR = 44100
+              private const val FRAME = 512 // ~11,6 ms por bloco
+
+              @Volatile var semitones = 0f
+              @Volatile var robot = false
+              @Volatile var echo = false
+              @Volatile var volume = 1.0f
+              @Volatile var running = false
+              private var thread: Thread? = null
+
+              fun start(ctx: Context) {
+                  if (running) return
+                  running = true
+                  val app = ctx.applicationContext
+                  thread = Thread({ loop(app) }, "voice-engine").also {
+                      it.priority = Thread.MAX_PRIORITY
+                      it.start()
+                  }
+              }
+
+              fun stop() {
+                  running = false
+                  thread?.join(700)
+                  thread = null
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun loop(ctx: Context) {
+                  val minIn = AudioRecord.getMinBufferSize(
+                      SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  // VOICE_COMMUNICATION ativa cancelamento de eco/ruído do sistema, ajudando contra microfonia.
+                  val rec = AudioRecord(
+                      MediaRecorder.AudioSource.VOICE_COMMUNICATION, SR,
+                      AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                      max(minIn, FRAME * 4)
+                  )
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      rec.release(); running = false; return
+                  }
+
+                  val minOut = AudioTrack.getMinBufferSize(
+                      SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val track = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder().setSampleRate(SR)
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
+                      )
+                      .setBufferSizeInBytes(max(minOut, FRAME * 4))
+                      .setTransferMode(AudioTrack.MODE_STREAM)
+                      .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                      .build()
+
+                  // Força a saída no alto-falante do aparelho.
+                  val am = ctx.getSystemService(AudioManager::class.java)
+                  am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                      .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                      ?.let { track.preferredDevice = it }
+
+                  val shifter = PitchShifter(SR)
+                  val echoBuf = FloatArray(SR / 4) // eco de 250 ms
+                  var ep = 0
+                  var robotPhase = 0.0
+                  val inBuf = ShortArray(FRAME)
+                  val outBuf = ShortArray(FRAME)
+
+                  try {
+                      rec.startRecording()
+                      track.play()
+                      while (running) {
+                          val n = rec.read(inBuf, 0, FRAME)
+                          if (n <= 0) continue
+                          val st = semitones
+                          shifter.ratio = 2f.pow(st / 12f)
+                          for (i in 0 until n) {
+                              var x = inBuf[i] / 32768f
+                              if (abs(st) >= 0.05f) x = shifter.process(x)
+                              if (robot) {
+                                  x *= sin(2.0 * PI * robotPhase).toFloat() * 1.4f
+                                  robotPhase += 50.0 / SR
+                                  if (robotPhase >= 1.0) robotPhase -= 1.0
+                              }
+                              if (echo) {
+                                  x += echoBuf[ep] * 0.4f
+                                  echoBuf[ep] = x
+                                  ep = (ep + 1) % echoBuf.size
+                              }
+                              x = tanh(x * volume) // limitador suave, evita estouro
+                              outBuf[i] = (x * 32767f).toInt().toShort()
+                          }
+                          track.write(outBuf, 0, n)
+                      }
+                  } finally {
+                      runCatching { rec.stop() }
+                      runCatching { track.stop() }
+                      rec.release()
+                      track.release()
+                      running = false
+                  }
+              }
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/voicechanger
+          cat > app/src/main/java/com/example/voicechanger/VoiceService.kt <<'REA_EOF_X'
+          package com.example.voicechanger
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          /** Mantém o motor de voz vivo em segundo plano (obrigatório para usar o microfone fora da tela). */
+          class VoiceService : Service() {
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      VoiceEngine.stop()
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Voice Changer", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val notification = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("Voice Changer ativo")
+                      .setContentText("Sua voz está sendo modificada em tempo real")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, notification)
+                  }
+                  VoiceEngine.start(this)
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  VoiceEngine.stop()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_STOP = "com.example.voicechanger.STOP"
+                  private const val CHANNEL = "voice_changer"
+              }
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'REA_EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="24dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Voice Changer"
+                      android:textSize="28sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="A saída toca no alto-falante. Use outro aparelho na ligação, ou o mesmo aparelho com o volume baixo, para evitar microfonia." />
+
+                  <Button
+                      android:id="@+id/btnToggle"
+                      android:layout_width="match_parent"
+                      android:layout_height="64dp"
+                      android:layout_marginTop="24dp"
+                      android:text="INICIAR"
+                      android:textSize="18sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:orientation="horizontal">
+
+                      <Button android:id="@+id/btnNormal" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Normal" />
+                      <Button android:id="@+id/btnDeep" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Grave" />
+                      <Button android:id="@+id/btnHigh" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Agudo" />
+                      <Button android:id="@+id/btnKid" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Criança" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/txtPitch"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="Tom: 0 semitons" />
+
+                  <SeekBar
+                      android:id="@+id/seekPitch"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:max="24"
+                      android:progress="12" />
+
+                  <CheckBox
+                      android:id="@+id/chkRobot"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Efeito robô" />
+
+                  <CheckBox
+                      android:id="@+id/chkEcho"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Eco" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="Volume de saída" />
+
+                  <SeekBar
+                      android:id="@+id/seekVolume"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:max="200"
+                      android:progress="100" />
+              </LinearLayout>
+          </ScrollView>
+          REA_EOF_X
+          cat > build.gradle.kts <<'REA_EOF_X'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          REA_EOF_X
+          cat > gradle.properties <<'REA_EOF_X'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          REA_EOF_X
+          cat > settings.gradle.kts <<'REA_EOF_X'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "VoiceChanger"
+          include(":app")
+          REA_EOF_X
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceChanger-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publicar APK em Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk VoiceChanger.apk
+          gh release create "apk-${{ github.run_number }}" VoiceChanger.apk --title "Voice Changer APK #${{ github.run_number }}" --notes "APK de teste (debug)."
