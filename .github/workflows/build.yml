@@ -18,11 +18,11 @@ jobs:
           }
 
           android {
-              namespace = "com.example.vozgrave"
+              namespace = "com.example.retoque"
               compileSdk = 34
 
               defaultConfig {
-                  applicationId = "com.example.vozgrave"
+                  applicationId = "com.example.retoque"
                   minSdk = 26
                   targetSdk = 34
                   versionCode = 1
@@ -38,6 +38,8 @@ jobs:
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.mlkit:face-detection:16.1.7")
+              implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
           }
           REA_EOF_X
           mkdir -p app/src/main
@@ -45,10 +47,13 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
 
               <application
-                  android:label="Voz Grave"
+                  android:label="Retoque"
+                  android:largeHeap="true"
                   android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
                   <activity
@@ -59,752 +64,1204 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
-
-                  <provider
-                      android:name="androidx.core.content.FileProvider"
-                      android:authorities="${applicationId}.fileprovider"
-                      android:exported="false"
-                      android:grantUriPermissions="true">
-                      <meta-data
-                          android:name="android.support.FILE_PROVIDER_PATHS"
-                          android:resource="@xml/file_paths" />
-                  </provider>
               </application>
           </manifest>
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/vozgrave
-          cat > app/src/main/java/com/example/vozgrave/LiveEngine.kt <<'REA_EOF_X'
-          package com.example.vozgrave
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/Detector.kt <<'REA_EOF_X'
+          package com.example.retoque
 
-          import android.annotation.SuppressLint
-          import android.media.AudioAttributes
-          import android.media.AudioFormat
-          import android.media.AudioRecord
-          import android.media.AudioTrack
-          import android.media.MediaRecorder
-          import android.os.Process
-          import kotlin.math.abs
-          import kotlin.math.max
-          import kotlin.math.pow
-          import kotlin.math.tanh
+          import android.graphics.Bitmap
+          import android.graphics.PointF
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.Face
+          import com.google.mlkit.vision.face.FaceContour
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetectorOptions
+          import com.google.mlkit.vision.face.FaceLandmark
+          import com.google.mlkit.vision.pose.Pose
+          import com.google.mlkit.vision.pose.PoseDetection
+          import com.google.mlkit.vision.pose.PoseLandmark
+          import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
 
-          /** Modo ao vivo: microfone -> voz mais grave -> saída (use com fone para não ter eco). */
-          object LiveEngine {
-              private const val SR = 48000
-              private const val FRAME = 960
-              private const val HP_A = 0.985f
-              private const val LP_ALPHA = 0.34f
-              private const val GATE = 0.012f
+          /** Detecta rosto (contornos) e corpo (articulações) no aparelho, sem internet. */
+          object Detector {
 
-              @Volatile var semitonesDown = 4f
-              @Volatile var running = false
-              private var thread: Thread? = null
-
-              fun start() {
-                  if (running) return
-                  running = true
-                  thread = Thread({ loop() }, "live-engine").also { it.start() }
-              }
-
-              fun stop() {
-                  running = false
-                  thread?.join(700)
-                  thread = null
-              }
-
-              @SuppressLint("MissingPermission")
-              private fun loop() {
-                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-
-                  val minIn = AudioRecord.getMinBufferSize(
-                      SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-                  )
-                  val rec = AudioRecord(
-                      MediaRecorder.AudioSource.MIC, SR,
-                      AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                      max(minIn, FRAME * 2 * 4)
-                  )
-                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                      rec.release(); running = false; return
-                  }
-
-                  val minOut = AudioTrack.getMinBufferSize(
-                      SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-                  )
-                  val track = AudioTrack.Builder()
-                      .setAudioAttributes(
-                          AudioAttributes.Builder()
-                              .setUsage(AudioAttributes.USAGE_MEDIA)
-                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-                      )
-                      .setAudioFormat(
-                          AudioFormat.Builder().setSampleRate(SR)
-                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
-                      )
-                      .setBufferSizeInBytes(max(minOut, FRAME * 2 * 4))
-                      .setTransferMode(AudioTrack.MODE_STREAM)
+              fun detect(bmp: Bitmap, onDone: (Landmarks) -> Unit) {
+                  val image = InputImage.fromBitmap(bmp, 0)
+                  val options = FaceDetectorOptions.Builder()
+                      .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                      .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+                      .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
                       .build()
+                  FaceDetection.getClient(options).process(image)
+                      .addOnSuccessListener { faces -> detectPose(image, faces.map { toFace(it) }, onDone) }
+                      .addOnFailureListener { detectPose(image, emptyList(), onDone) }
+              }
 
-                  val shifter = PitchShifter(SR)
-                  val inBuf = ShortArray(FRAME)
-                  val outBuf = ShortArray(FRAME)
-                  var hpX = 0f; var hpY = 0f; var lp = 0f
-                  var env = 0f; var g = 0f
+              private fun detectPose(image: InputImage, faces: List<FaceData>, onDone: (Landmarks) -> Unit) {
+                  val options = PoseDetectorOptions.Builder()
+                      .setDetectorMode(PoseDetectorOptions.SINGLE_IMAGE_MODE)
+                      .build()
+                  PoseDetection.getClient(options).process(image)
+                      .addOnSuccessListener { pose -> onDone(Landmarks(faces, toBody(pose))) }
+                      .addOnFailureListener { onDone(Landmarks(faces, null)) }
+              }
 
-                  try {
-                      val silence = ShortArray(FRAME)
-                      track.write(silence, 0, FRAME)
-                      track.write(silence, 0, FRAME)
-                      rec.startRecording()
-                      track.play()
+              private fun toFace(face: Face): FaceData {
+                  fun pts(type: Int): List<PointF> = face.getContour(type)?.points ?: emptyList()
+                  fun lm(type: Int): PointF? = face.getLandmark(type)?.position
+                  return FaceData(
+                      bounds = face.boundingBox,
+                      outline = pts(FaceContour.FACE),
+                      leftEye = pts(FaceContour.LEFT_EYE),
+                      rightEye = pts(FaceContour.RIGHT_EYE),
+                      brows = listOf(
+                          pts(FaceContour.LEFT_EYEBROW_TOP),
+                          pts(FaceContour.LEFT_EYEBROW_BOTTOM),
+                          pts(FaceContour.RIGHT_EYEBROW_TOP),
+                          pts(FaceContour.RIGHT_EYEBROW_BOTTOM)
+                      ),
+                      upperLipTop = pts(FaceContour.UPPER_LIP_TOP),
+                      upperLipBottom = pts(FaceContour.UPPER_LIP_BOTTOM),
+                      lowerLipTop = pts(FaceContour.LOWER_LIP_TOP),
+                      lowerLipBottom = pts(FaceContour.LOWER_LIP_BOTTOM),
+                      noseBottom = pts(FaceContour.NOSE_BOTTOM),
+                      mouthLeft = lm(FaceLandmark.MOUTH_LEFT),
+                      mouthRight = lm(FaceLandmark.MOUTH_RIGHT),
+                      leftCheek = lm(FaceLandmark.LEFT_CHEEK),
+                      rightCheek = lm(FaceLandmark.RIGHT_CHEEK)
+                  )
+              }
 
-                      while (running) {
-                          val n = rec.read(inBuf, 0, FRAME)
-                          if (n <= 0) continue
-                          shifter.ratio = 2f.pow(-semitonesDown / 12f)
-
-                          for (i in 0 until n) {
-                              var x = inBuf[i] / 32768f
-                              val hp = HP_A * (hpY + x - hpX)
-                              hpX = x; hpY = hp
-                              lp += LP_ALPHA * (hp - lp)
-                              x = lp
-
-                              val ax = abs(x)
-                              env = if (ax > env) ax else env * 0.9995f
-                              val target = if (env > GATE) 1f else 0f
-                              g += (target - g) * (if (target > g) 0.02f else 0.0008f)
-                              x *= g
-
-                              x = shifter.process(x)
-                              x = tanh(x * 2f)
-                              outBuf[i] = (x * 32767f).toInt().toShort()
-                          }
-                          track.write(outBuf, 0, n)
-                      }
-                  } finally {
-                      runCatching { rec.stop() }
-                      runCatching { track.stop() }
-                      rec.release()
-                      track.release()
-                      running = false
-                  }
+              private fun toBody(pose: Pose): BodyData? {
+                  fun lm(type: Int): PointF? =
+                      pose.getPoseLandmark(type)?.takeIf { it.inFrameLikelihood > 0.5f }?.position
+                  val ls = lm(PoseLandmark.LEFT_SHOULDER)
+                  val rs = lm(PoseLandmark.RIGHT_SHOULDER)
+                  val lh = lm(PoseLandmark.LEFT_HIP)
+                  val rh = lm(PoseLandmark.RIGHT_HIP)
+                  if (ls == null || rs == null || lh == null || rh == null) return null
+                  return BodyData(
+                      leftShoulder = ls,
+                      rightShoulder = rs,
+                      leftHip = lh,
+                      rightHip = rh,
+                      leftKnee = lm(PoseLandmark.LEFT_KNEE),
+                      rightKnee = lm(PoseLandmark.RIGHT_KNEE),
+                      leftAnkle = lm(PoseLandmark.LEFT_ANKLE),
+                      rightAnkle = lm(PoseLandmark.RIGHT_ANKLE)
+                  )
               }
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/vozgrave
-          cat > app/src/main/java/com/example/vozgrave/MainActivity.kt <<'REA_EOF_X'
-          package com.example.vozgrave
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/ImageOps.kt <<'REA_EOF_X'
+          package com.example.retoque
 
-          import android.Manifest
-          import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.media.AudioDeviceInfo
-          import android.media.AudioManager
-          import android.media.MediaPlayer
+          import android.graphics.Bitmap
+          import android.graphics.BlurMaskFilter
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ColorMatrix
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PointF
+          import android.graphics.RadialGradient
+          import android.graphics.Shader
+          import kotlin.math.abs
+          import kotlin.math.exp
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+
+          object ImageOps {
+
+              private fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 255f) 255 else (v + 0.5f).toInt()
+
+              /** Desfoque de caixa separável (rápido), canal a canal. */
+              fun boxBlur(src: IntArray, w: Int, h: Int, r: Int): IntArray {
+                  if (r < 1) return src.copyOf()
+                  val tmp = IntArray(w * h)
+                  val out = IntArray(w * h)
+                  val div = 2 * r + 1
+                  for (y in 0 until h) {
+                      val row = y * w
+                      var sr = 0
+                      var sg = 0
+                      var sb = 0
+                      for (i in -r..r) {
+                          val p = src[row + i.coerceIn(0, w - 1)]
+                          sr += (p shr 16) and 255
+                          sg += (p shr 8) and 255
+                          sb += p and 255
+                      }
+                      for (x in 0 until w) {
+                          tmp[row + x] = (0xFF shl 24) or ((sr / div) shl 16) or ((sg / div) shl 8) or (sb / div)
+                          val add = src[row + (x + r + 1).coerceAtMost(w - 1)]
+                          val rem = src[row + (x - r).coerceAtLeast(0)]
+                          sr += ((add shr 16) and 255) - ((rem shr 16) and 255)
+                          sg += ((add shr 8) and 255) - ((rem shr 8) and 255)
+                          sb += (add and 255) - (rem and 255)
+                      }
+                  }
+                  for (x in 0 until w) {
+                      var sr = 0
+                      var sg = 0
+                      var sb = 0
+                      for (i in -r..r) {
+                          val p = tmp[i.coerceIn(0, h - 1) * w + x]
+                          sr += (p shr 16) and 255
+                          sg += (p shr 8) and 255
+                          sb += p and 255
+                      }
+                      for (y in 0 until h) {
+                          out[y * w + x] = (0xFF shl 24) or ((sr / div) shl 16) or ((sg / div) shl 8) or (sb / div)
+                          val add = tmp[(y + r + 1).coerceAtMost(h - 1) * w + x]
+                          val rem = tmp[(y - r).coerceAtLeast(0) * w + x]
+                          sr += ((add shr 16) and 255) - ((rem shr 16) and 255)
+                          sg += ((add shr 8) and 255) - ((rem shr 8) and 255)
+                          sb += (add and 255) - (rem and 255)
+                      }
+                  }
+                  return out
+              }
+
+              private fun pathOf(pts: List<PointF>): Path {
+                  val path = Path()
+                  if (pts.isEmpty()) return path
+                  path.moveTo(pts[0].x, pts[0].y)
+                  for (i in 1 until pts.size) path.lineTo(pts[i].x, pts[i].y)
+                  path.close()
+                  return path
+              }
+
+              private fun join(a: List<PointF>, b: List<PointF>): List<PointF> {
+                  if (a.isEmpty() || b.isEmpty()) return a + b
+                  val last = a.last()
+                  val dFirst = hypot(last.x - b.first().x, last.y - b.first().y)
+                  val dLast = hypot(last.x - b.last().x, last.y - b.last().y)
+                  return a + (if (dFirst > dLast) b.reversed() else b)
+              }
+
+              private fun lipOuter(f: FaceData) = join(f.upperLipTop, f.lowerLipBottom)
+              private fun lipInner(f: FaceData) = join(f.upperLipBottom, f.lowerLipTop)
+
+              /** Máscara de pele (0..1): rosto sem olhos, sobrancelhas e lábios, com borda suave. */
+              fun faceMask(w: Int, h: Int, faces: List<FaceData>): FloatArray {
+                  val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bmp)
+                  c.drawColor(Color.BLACK)
+                  var minFace = w
+                  for (f in faces) minFace = min(minFace, f.bounds.width())
+                  val white = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.WHITE
+                      style = Paint.Style.FILL
+                  }
+                  val black = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.BLACK
+                      style = Paint.Style.FILL_AND_STROKE
+                      strokeWidth = max(2f, minFace * 0.03f)
+                  }
+                  for (f in faces) {
+                      c.drawPath(pathOf(f.outline), white)
+                      c.drawPath(pathOf(f.leftEye), black)
+                      c.drawPath(pathOf(f.rightEye), black)
+                      for (b in f.brows) c.drawPath(pathOf(b), black)
+                      c.drawPath(pathOf(lipOuter(f)), black)
+                  }
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, 0, 0, w, h)
+                  bmp.recycle()
+                  val r = max(2, minFace / 25)
+                  val blurred = boxBlur(boxBlur(px, w, h, r), w, h, r)
+                  return FloatArray(w * h) { ((blurred[it] shr 16) and 255) / 255f }
+              }
+
+              /** Suaviza a pele preservando bordas (olhos, cabelo, contornos). */
+              fun smoothSkin(px: IntArray, w: Int, h: Int, mask: FloatArray?, amount: Float) {
+                  val r = max(2, min(w, h) / 160)
+                  val blur = boxBlur(boxBlur(px, w, h, r), w, h, r)
+                  val inv2s2 = 1f / (2f * 20f * 20f)
+                  for (i in px.indices) {
+                      val m = if (mask != null) mask[i] else 1f
+                      if (m < 0.02f) continue
+                      val p = px[i]
+                      val b = blur[i]
+                      val pr = (p shr 16) and 255
+                      val pg = (p shr 8) and 255
+                      val pb = p and 255
+                      val br = (b shr 16) and 255
+                      val bg = (b shr 8) and 255
+                      val bb = b and 255
+                      val d = (abs(pr - br) + abs(pg - bg) + abs(pb - bb)) / 3f
+                      val edge = exp(-(d * d) * inv2s2)
+                      val t = amount * 0.9f * m * edge
+                      val nr = c8(pr + (br - pr) * t)
+                      val ng = c8(pg + (bg - pg) * t)
+                      val nb = c8(pb + (bb - pb) * t)
+                      px[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                  }
+              }
+
+              /** Clareia a pele. */
+              fun whiten(px: IntArray, mask: FloatArray?, amount: Float) {
+                  for (i in px.indices) {
+                      val m = if (mask != null) mask[i] else 1f
+                      if (m < 0.02f) continue
+                      val k = 0.28f * amount * m
+                      val p = px[i]
+                      val r = (p shr 16) and 255
+                      val g = (p shr 8) and 255
+                      val b = p and 255
+                      px[i] = (0xFF shl 24) or
+                          (c8(r + (255 - r) * k) shl 16) or
+                          (c8(g + (255 - g) * k) shl 8) or
+                          c8(b + (255 - b) * k)
+                  }
+              }
+
+              fun sharpen(px: IntArray, w: Int, h: Int, amount: Float) {
+                  val blur = boxBlur(px, w, h, 2)
+                  for (i in px.indices) {
+                      val p = px[i]
+                      val b = blur[i]
+                      val pr = (p shr 16) and 255
+                      val pg = (p shr 8) and 255
+                      val pb = p and 255
+                      val nr = c8(pr + amount * (pr - ((b shr 16) and 255)))
+                      val ng = c8(pg + amount * (pg - ((b shr 8) and 255)))
+                      val nb = c8(pb + amount * (pb - (b and 255)))
+                      px[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+                  }
+              }
+
+              /** Batom e blush desenhados sobre o bitmap. */
+              fun makeup(bmp: Bitmap, faces: List<FaceData>, lipstick: Int, blush: Int) {
+                  val c = Canvas(bmp)
+                  for (f in faces) {
+                      val fw = f.bounds.width().toFloat()
+                      if (lipstick > 0) {
+                          val outer = lipOuter(f)
+                          val inner = lipInner(f)
+                          if (outer.size >= 3) {
+                              val path = Path()
+                              path.fillType = Path.FillType.EVEN_ODD
+                              path.addPath(pathOf(outer))
+                              if (inner.size >= 3) path.addPath(pathOf(inner))
+                              val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                              paint.style = Paint.Style.FILL
+                              paint.color = Color.argb((lipstick * 1.6f).toInt().coerceIn(0, 160), 200, 30, 70)
+                              paint.maskFilter = BlurMaskFilter(max(1f, fw * 0.01f), BlurMaskFilter.Blur.NORMAL)
+                              c.drawPath(path, paint)
+                          }
+                      }
+                      if (blush > 0) {
+                          val alpha = (blush * 1.2f).toInt().coerceIn(0, 120)
+                          for (p in listOfNotNull(f.leftCheek, f.rightCheek)) {
+                              val r = fw * 0.2f
+                              val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                              paint.shader = RadialGradient(
+                                  p.x, p.y, r,
+                                  Color.argb(alpha, 255, 90, 110),
+                                  Color.argb(0, 255, 90, 110),
+                                  Shader.TileMode.CLAMP
+                              )
+                              c.drawCircle(p.x, p.y, r, paint)
+                          }
+                      }
+                  }
+              }
+
+              private val IDENTITY = floatArrayOf(
+                  1f, 0f, 0f, 0f, 0f,
+                  0f, 1f, 0f, 0f, 0f,
+                  0f, 0f, 1f, 0f, 0f,
+                  0f, 0f, 0f, 1f, 0f
+              )
+
+              private fun scaleArr(r: Float, g: Float, b: Float, off: Float = 0f) = floatArrayOf(
+                  r, 0f, 0f, 0f, off,
+                  0f, g, 0f, 0f, off,
+                  0f, 0f, b, 0f, off,
+                  0f, 0f, 0f, 1f, 0f
+              )
+
+              private fun contrastArr(c: Float): FloatArray = scaleArr(c, c, c, (1f - c) * 127.5f)
+
+              private fun satMatrix(s: Float): ColorMatrix {
+                  val m = ColorMatrix()
+                  m.setSaturation(s)
+                  return m
+              }
+
+              private fun filterArray(idx: Int): FloatArray {
+                  return when (idx) {
+                      1 -> {
+                          val m = satMatrix(1.45f)
+                          m.postConcat(ColorMatrix(contrastArr(1.1f)))
+                          m.array
+                      }
+                      2 -> {
+                          val m = satMatrix(0f)
+                          m.postConcat(ColorMatrix(contrastArr(1.15f)))
+                          m.array
+                      }
+                      3 -> floatArrayOf(
+                          0.393f, 0.769f, 0.189f, 0f, 0f,
+                          0.349f, 0.686f, 0.168f, 0f, 0f,
+                          0.272f, 0.534f, 0.131f, 0f, 0f,
+                          0f, 0f, 0f, 1f, 0f
+                      )
+                      4 -> scaleArr(0.90f, 1.0f, 1.15f)
+                      5 -> scaleArr(1.15f, 1.0f, 0.88f)
+                      6 -> {
+                          val m = ColorMatrix(scaleArr(0.86f, 0.86f, 0.86f, 22f))
+                          m.postConcat(satMatrix(0.9f))
+                          m.array
+                      }
+                      7 -> {
+                          val m = satMatrix(0.75f)
+                          m.postConcat(ColorMatrix(scaleArr(1.08f, 1.0f, 0.85f, 8f)))
+                          m.array
+                      }
+                      else -> IDENTITY
+                  }
+              }
+
+              fun colorMatrix(
+                  brightness: Int, contrast: Int, saturation: Int, warmth: Int,
+                  filter: Int, fstrength: Int
+              ): ColorMatrix {
+                  val cm = ColorMatrix()
+                  cm.postConcat(satMatrix(max(0f, 1f + saturation / 100f)))
+                  val c = 1f + contrast / 100f
+                  val t = (1f - c) * 127.5f + brightness * 1.5f
+                  cm.postConcat(ColorMatrix(scaleArr(c, c, c, t)))
+                  val wv = warmth / 100f
+                  cm.postConcat(ColorMatrix(scaleArr(1f + 0.3f * wv, 1f, 1f - 0.3f * wv)))
+                  if (filter != 0 && fstrength > 0) {
+                      val s = fstrength / 100f
+                      val f = filterArray(filter)
+                      cm.postConcat(ColorMatrix(FloatArray(20) { IDENTITY[it] + (f[it] - IDENTITY[it]) * s }))
+                  }
+                  return cm
+              }
+          }
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/MainActivity.kt <<'REA_EOF_X'
+          package com.example.retoque
+
+          import android.content.ContentValues
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.media.ExifInterface
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
-          import android.view.WindowManager
+          import android.provider.MediaStore
+          import android.view.MotionEvent
+          import android.view.View
           import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.ImageView
+          import android.widget.LinearLayout
           import android.widget.SeekBar
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.appcompat.app.AlertDialog
           import androidx.appcompat.app.AppCompatActivity
-          import androidx.core.content.ContextCompat
-          import androidx.core.content.FileProvider
-          import java.io.File
+          import java.util.concurrent.Executors
+          import kotlin.math.max
+
+          class Tool(val id: String, val label: String, val min: Int, val max: Int)
 
           class MainActivity : AppCompatActivity() {
 
-              private lateinit var btnRecord: Button
-              private lateinit var btnPlay: Button
-              private lateinit var btnShare: Button
-              private lateinit var btnApply: Button
-              private lateinit var btnLive: Button
-              private lateinit var seekGrave: SeekBar
-              private lateinit var txtGrave: TextView
-              private lateinit var txtStatus: TextView
+              private lateinit var img: ImageView
+              private lateinit var hint: TextView
+              private lateinit var info: TextView
+              private lateinit var tabRow: LinearLayout
+              private lateinit var toolBox: LinearLayout
 
-              private val recorder = Recorder()
-              private var raw: ShortArray? = null
-              private var player: MediaPlayer? = null
-              private var recording = false
-              private var hasResult = false
-              private lateinit var outFile: File
-              private var pendingAction: (() -> Unit)? = null
+              private var base: Bitmap? = null
+              private var shown: Bitmap? = null
+              private var landmarks: Landmarks? = null
+              private val params = HashMap<String, Int>()
+              private val executor = Executors.newSingleThreadExecutor()
+              @Volatile private var gen = 0
+              private var currentTab = "Rosto"
+              private var warnedBody = false
+              private var warnedFace = false
 
-              private val permLauncher =
-                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-                      if (granted) pendingAction?.invoke()
-                      else Toast.makeText(this, "A permissão do microfone é necessária", Toast.LENGTH_LONG).show()
-                      pendingAction = null
+              private val tabs: LinkedHashMap<String, List<Tool>> = linkedMapOf(
+                  "Rosto" to listOf(
+                      Tool("smooth", "Suavizar pele", 0, 100),
+                      Tool("whiten", "Clarear pele", 0, 100),
+                      Tool("faceSlim", "Afinar rosto", 0, 100),
+                      Tool("chin", "Queixo menor", 0, 100),
+                      Tool("eyes", "Olhos maiores", 0, 100),
+                      Tool("nose", "Nariz mais fino", 0, 100),
+                      Tool("smile", "Sorriso", 0, 100)
+                  ),
+                  "Maquiagem" to listOf(
+                      Tool("lipstick", "Batom", 0, 100),
+                      Tool("blush", "Blush", 0, 100)
+                  ),
+                  "Corpo" to listOf(
+                      Tool("bodySlim", "Corpo mais fino", 0, 100),
+                      Tool("waist", "Cintura", 0, 100),
+                      Tool("legLong", "Pernas mais longas", 0, 100),
+                      Tool("legSlim", "Pernas mais finas", 0, 100),
+                      Tool("headSmall", "Cabeça menor", 0, 100)
+                  ),
+                  "Cor" to listOf(
+                      Tool("brightness", "Brilho", -50, 50),
+                      Tool("contrast", "Contraste", -50, 50),
+                      Tool("saturation", "Saturação", -50, 50),
+                      Tool("warmth", "Frio / quente", -50, 50),
+                      Tool("sharp", "Nitidez", 0, 100)
+                  ),
+                  "Filtros" to emptyList<Tool>()
+              )
+
+              private val filterNames = listOf("Original", "Vívido", "P&B", "Sépia", "Frio", "Quente", "Suave", "Retrô")
+              private val bodyIds = setOf("bodySlim", "waist", "legLong", "legSlim")
+              private val faceIds = setOf("faceSlim", "chin", "eyes", "nose", "smile", "headSmall", "lipstick", "blush")
+
+              private val pickImage =
+                  registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                      if (uri != null) loadImage(uri)
                   }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContentView(R.layout.activity_main)
-                  outFile = File(cacheDir, "voz_grave.wav")
 
-                  btnRecord = findViewById(R.id.btnRecord)
-                  btnPlay = findViewById(R.id.btnPlay)
-                  btnShare = findViewById(R.id.btnShare)
-                  btnApply = findViewById(R.id.btnApply)
-                  btnLive = findViewById(R.id.btnLive)
-                  seekGrave = findViewById(R.id.seekGrave)
-                  txtGrave = findViewById(R.id.txtGrave)
-                  txtStatus = findViewById(R.id.txtStatus)
+                  img = findViewById(R.id.img)
+                  hint = findViewById(R.id.hint)
+                  info = findViewById(R.id.info)
+                  tabRow = findViewById(R.id.tabRow)
+                  toolBox = findViewById(R.id.toolBox)
 
-                  updateGraveText()
-                  refreshButtons()
+                  initParams()
+                  for (name in tabs.keys) {
+                      val b = Button(this)
+                      b.text = name
+                      b.setOnClickListener { showTab(name) }
+                      tabRow.addView(b)
+                  }
+                  showTab(currentTab)
 
-                  seekGrave.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                  findViewById<Button>(R.id.btnOpen).setOnClickListener { pickImage.launch("image/*") }
+                  findViewById<Button>(R.id.btnSave).setOnClickListener { save() }
+                  findViewById<Button>(R.id.btnReset).setOnClickListener { resetAll() }
+                  findViewById<Button>(R.id.btnCompare).setOnTouchListener { _, ev ->
+                      if (ev.action == MotionEvent.ACTION_DOWN) {
+                          base?.let { img.setImageBitmap(it) }
+                      } else if (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) {
+                          (shown ?: base)?.let { img.setImageBitmap(it) }
+                      }
+                      true
+                  }
+              }
+
+              private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
+
+              private fun initParams() {
+                  params.clear()
+                  params["fstrength"] = 100
+              }
+
+              private fun resetAll() {
+                  initParams()
+                  shown = null
+                  base?.let { img.setImageBitmap(it) }
+                  showTab(currentTab)
+              }
+
+              private fun showTab(name: String) {
+                  currentTab = name
+                  for (i in 0 until tabRow.childCount) {
+                      val b = tabRow.getChildAt(i) as Button
+                      b.alpha = if (b.text.toString() == name) 1f else 0.45f
+                  }
+                  toolBox.removeAllViews()
+                  if (name == "Filtros") {
+                      val sv = HorizontalScrollView(this)
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      filterNames.forEachIndexed { i, n ->
+                          val b = Button(this)
+                          b.text = n
+                          b.setOnClickListener {
+                              params["filter"] = i
+                              onParamChanged("filter")
+                          }
+                          row.addView(b)
+                      }
+                      sv.addView(row)
+                      toolBox.addView(sv)
+                      addSlider(Tool("fstrength", "Intensidade do filtro", 0, 100))
+                  } else {
+                      tabs[name]?.forEach { addSlider(it) }
+                  }
+              }
+
+              private fun addSlider(tool: Tool) {
+                  val value = params[tool.id] ?: 0
+                  val label = TextView(this)
+                  label.setTextColor(Color.WHITE)
+                  label.text = "${tool.label}: $value"
+                  label.setPadding(0, dp(8), 0, 0)
+                  val sb = SeekBar(this)
+                  sb.max = tool.max - tool.min
+                  sb.progress = value - tool.min
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                       override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                          updateGraveText()
-                          LiveEngine.semitonesDown = semitones().toFloat()
+                          val v = p + tool.min
+                          params[tool.id] = v
+                          label.text = "${tool.label}: $v"
                       }
                       override fun onStartTrackingTouch(s: SeekBar?) {}
-                      override fun onStopTrackingTouch(s: SeekBar?) {}
-                  })
-
-                  btnRecord.setOnClickListener { toggleRecord() }
-                  btnPlay.setOnClickListener { togglePlay() }
-                  btnShare.setOnClickListener { share() }
-                  btnApply.setOnClickListener { convert() }
-                  btnLive.setOnClickListener { toggleLive() }
-              }
-
-              override fun onStop() {
-                  super.onStop()
-                  if (LiveEngine.running) stopLive()
-                  stopPlayer()
-              }
-
-              override fun onDestroy() {
-                  stopPlayer()
-                  super.onDestroy()
-              }
-
-              private fun semitones(): Int = seekGrave.progress + 1
-
-              private fun updateGraveText() {
-                  txtGrave.text = "Quão grave: ${semitones()} semitons"
-              }
-
-              private fun setStatus(s: String) {
-                  txtStatus.text = s
-              }
-
-              private fun refreshButtons() {
-                  btnPlay.isEnabled = hasResult
-                  btnShare.isEnabled = hasResult
-                  btnApply.isEnabled = raw != null
-              }
-
-              private fun withMic(action: () -> Unit) {
-                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                      == PackageManager.PERMISSION_GRANTED
-                  ) {
-                      action()
-                  } else {
-                      pendingAction = action
-                      permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                  }
-              }
-
-              // ---------- Gravar e converter ----------
-
-              private fun toggleRecord() {
-                  if (!recording) {
-                      withMic {
-                          stopPlayer()
-                          if (recorder.start()) {
-                              recording = true
-                              btnRecord.text = "PARAR GRAVAÇÃO"
-                              setStatus("Gravando... fale normalmente.")
-                          } else {
-                              setStatus("Não foi possível usar o microfone.")
-                          }
+                      override fun onStopTrackingTouch(s: SeekBar?) {
+                          onParamChanged(tool.id)
                       }
-                  } else {
-                      recording = false
-                      btnRecord.text = "GRAVAR"
-                      raw = recorder.stop()
-                      convert()
-                  }
+                  })
+                  toolBox.addView(label)
+                  toolBox.addView(sb)
               }
 
-              private fun convert() {
-                  val data = raw ?: return
-                  if (data.size < 4410) {
-                      setStatus("Gravação muito curta. Grave de novo.")
-                      return
+              private fun onParamChanged(id: String) {
+                  if (base == null) return
+                  val lm = landmarks
+                  if (lm != null && (params[id] ?: 0) > 0) {
+                      if (id in bodyIds && lm.body == null && !warnedBody) {
+                          warnedBody = true
+                          Toast.makeText(
+                              this,
+                              "Corpo não detectado. Use uma foto com o corpo todo visível, de frente.",
+                              Toast.LENGTH_LONG
+                          ).show()
+                      }
+                      val hasFace = lm.faces.any { it.outline.isNotEmpty() }
+                      if (id in faceIds && !hasFace && !warnedFace) {
+                          warnedFace = true
+                          Toast.makeText(
+                              this,
+                              "Rosto não detectado. Use uma foto com o rosto bem visível.",
+                              Toast.LENGTH_LONG
+                          ).show()
+                      }
                   }
-                  stopPlayer()
-                  setStatus("Processando... aguarde.")
-                  btnRecord.isEnabled = false
-                  btnApply.isEnabled = false
-                  btnPlay.isEnabled = false
-                  btnShare.isEnabled = false
-                  val st = semitones().toFloat()
-                  Thread {
+                  render()
+              }
+
+              private fun render() {
+                  val b = base ?: return
+                  val myGen = ++gen
+                  val pc = HashMap(params)
+                  val lm = landmarks
+                  executor.execute {
+                      if (myGen != gen) return@execute
                       val out = try {
-                          VoiceDeepener.process(data, st)
+                          Pipeline.run(b, pc, lm)
                       } catch (e: Throwable) {
                           null
                       }
-                      if (out != null) WavWriter.write(outFile, out, Recorder.SR)
                       runOnUiThread {
-                          hasResult = out != null
-                          btnRecord.isEnabled = true
-                          setStatus(
-                              if (out != null) "Pronto! Toque em OUVIR ou COMPARTILHAR."
-                              else "Erro ao processar. Tente uma gravação mais curta."
-                          )
-                          refreshButtons()
+                          if (myGen == gen && out != null) {
+                              shown = out
+                              img.setImageBitmap(out)
+                          }
+                      }
+                  }
+              }
+
+              private fun loadImage(uri: Uri) {
+                  info.text = "Carregando foto..."
+                  Thread {
+                      val bmp = try {
+                          decode(uri)
+                      } catch (e: Throwable) {
+                          null
+                      }
+                      runOnUiThread {
+                          if (bmp == null) {
+                              info.text = ""
+                              Toast.makeText(this, "Não foi possível abrir a foto", Toast.LENGTH_LONG).show()
+                          } else {
+                              base = bmp
+                              shown = null
+                              landmarks = null
+                              warnedBody = false
+                              warnedFace = false
+                              initParams()
+                              showTab(currentTab)
+                              img.setImageBitmap(bmp)
+                              hint.visibility = View.GONE
+                              info.text = "Detectando rosto e corpo..."
+                              Detector.detect(bmp) { lm ->
+                                  runOnUiThread {
+                                      if (base === bmp) {
+                                          landmarks = lm
+                                          val hasFace = lm.faces.any { it.outline.isNotEmpty() }
+                                          info.text = "Rosto: " + (if (hasFace) "detectado" else "não detectado") +
+                                              "   |   Corpo: " + (if (lm.body != null) "detectado" else "não detectado")
+                                      }
+                                  }
+                              }
+                          }
                       }
                   }.start()
               }
 
-              private fun togglePlay() {
-                  if (player != null) {
-                      stopPlayer()
+              private fun decode(uri: Uri): Bitmap? {
+                  val maxSide = 1600
+                  val bounds = BitmapFactory.Options()
+                  bounds.inJustDecodeBounds = true
+                  contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                  var sample = 1
+                  while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
+                  val opts = BitmapFactory.Options()
+                  opts.inSampleSize = sample
+                  var bmp = contentResolver.openInputStream(uri)?.use {
+                      BitmapFactory.decodeStream(it, null, opts)
+                  } ?: return null
+                  val longSide = max(bmp.width, bmp.height)
+                  if (longSide > maxSide) {
+                      val s = maxSide.toFloat() / longSide
+                      bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt(), (bmp.height * s).toInt(), true)
+                  }
+                  val orientation = contentResolver.openInputStream(uri)?.use {
+                      ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                  } ?: ExifInterface.ORIENTATION_NORMAL
+                  val m = Matrix()
+                  when (orientation) {
+                      ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
+                      ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
+                      ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
+                      ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
+                      ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
+                      else -> {}
+                  }
+                  if (!m.isIdentity) {
+                      bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                  }
+                  return bmp
+              }
+
+              private fun save() {
+                  val bmp = shown ?: base
+                  if (bmp == null) {
+                      Toast.makeText(this, "Abra uma foto primeiro", Toast.LENGTH_SHORT).show()
                       return
                   }
-                  try {
-                      player = MediaPlayer().apply {
-                          setDataSource(outFile.absolutePath)
-                          setOnCompletionListener { stopPlayer() }
-                          prepare()
-                          start()
+                  Thread {
+                      val ok = try {
+                          val values = ContentValues()
+                          values.put(MediaStore.Images.Media.DISPLAY_NAME, "Retoque_" + System.currentTimeMillis() + ".jpg")
+                          values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Retoque")
+                          }
+                          val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                          if (uri == null) {
+                              false
+                          } else {
+                              contentResolver.openOutputStream(uri)?.use {
+                                  bmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
+                              } ?: false
+                          }
+                      } catch (e: Throwable) {
+                          false
                       }
-                      btnPlay.text = "PARAR"
-                  } catch (e: Exception) {
-                      stopPlayer()
-                      setStatus("Não foi possível tocar o áudio.")
-                  }
-              }
-
-              private fun stopPlayer() {
-                  player?.let {
-                      runCatching { it.stop() }
-                      it.release()
-                  }
-                  player = null
-                  if (::btnPlay.isInitialized) btnPlay.text = "OUVIR"
-              }
-
-              private fun share() {
-                  val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", outFile)
-                  val i = Intent(Intent.ACTION_SEND).apply {
-                      type = "audio/wav"
-                      putExtra(Intent.EXTRA_STREAM, uri)
-                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                  }
-                  startActivity(Intent.createChooser(i, "Enviar áudio por"))
-              }
-
-              // ---------- Ao vivo (com fone) ----------
-
-              private fun toggleLive() {
-                  if (LiveEngine.running) {
-                      stopLive()
-                      return
-                  }
-                  withMic {
-                      if (!hasHeadset()) {
-                          AlertDialog.Builder(this)
-                              .setTitle("Conecte um fone")
-                              .setMessage(
-                                  "Sem fone, o alto-falante entra no microfone e causa eco alto. " +
-                                      "Conecte um fone (com fio, USB-C ou Bluetooth) e toque em INICIAR de novo."
-                              )
-                              .setPositiveButton("OK", null)
-                              .show()
-                      } else {
-                          startLive()
+                      runOnUiThread {
+                          Toast.makeText(
+                              this,
+                              if (ok) "Salvo na galeria (Pictures/Retoque)" else "Não foi possível salvar",
+                              Toast.LENGTH_LONG
+                          ).show()
                       }
-                  }
-              }
-
-              private fun startLive() {
-                  LiveEngine.semitonesDown = semitones().toFloat()
-                  LiveEngine.start()
-                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  btnLive.text = "PARAR AO VIVO"
-                  setStatus("Ao vivo ligado. Fale: a voz grave sai no fone.")
-                  btnLive.postDelayed({
-                      if (!LiveEngine.running) stopLive()
-                  }, 800)
-              }
-
-              private fun stopLive() {
-                  LiveEngine.stop()
-                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  btnLive.text = "INICIAR AO VIVO"
-                  setStatus("Ao vivo desligado.")
-              }
-
-              private fun hasHeadset(): Boolean {
-                  val am = getSystemService(AudioManager::class.java)
-                  val ok = mutableListOf(
-                      AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                      AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-                      AudioDeviceInfo.TYPE_USB_HEADSET,
-                      AudioDeviceInfo.TYPE_USB_DEVICE,
-                      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
-                  )
-                  if (Build.VERSION.SDK_INT >= 31) ok.add(AudioDeviceInfo.TYPE_BLE_HEADSET)
-                  return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { it.type in ok }
+                  }.start()
               }
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/vozgrave
-          cat > app/src/main/java/com/example/vozgrave/PitchShifter.kt <<'REA_EOF_X'
-          package com.example.vozgrave
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/Models.kt <<'REA_EOF_X'
+          package com.example.retoque
 
+          import android.graphics.PointF
+          import android.graphics.Rect
+
+          class FaceData(
+              val bounds: Rect,
+              val outline: List<PointF>,
+              val leftEye: List<PointF>,
+              val rightEye: List<PointF>,
+              val brows: List<List<PointF>>,
+              val upperLipTop: List<PointF>,
+              val upperLipBottom: List<PointF>,
+              val lowerLipTop: List<PointF>,
+              val lowerLipBottom: List<PointF>,
+              val noseBottom: List<PointF>,
+              val mouthLeft: PointF?,
+              val mouthRight: PointF?,
+              val leftCheek: PointF?,
+              val rightCheek: PointF?
+          )
+
+          class BodyData(
+              val leftShoulder: PointF,
+              val rightShoulder: PointF,
+              val leftHip: PointF,
+              val rightHip: PointF,
+              val leftKnee: PointF?,
+              val rightKnee: PointF?,
+              val leftAnkle: PointF?,
+              val rightAnkle: PointF?
+          )
+
+          class Landmarks(val faces: List<FaceData>, val body: BodyData?)
+          REA_EOF_X
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/Pipeline.kt <<'REA_EOF_X'
+          package com.example.retoque
+
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.ColorMatrixColorFilter
+          import android.graphics.Paint
+          import android.graphics.PointF
           import kotlin.math.abs
+          import kotlin.math.hypot
 
           /**
-           * Troca de tom em tempo real (delay line com dois "taps" e crossfade triangular).
-           * ratio < 1 = voz mais grave.
+           * Ordem: pele/maquiagem/cor (usam as posições originais) -> nitidez -> deformações (por último).
+           * Todos os valores dos controles são lidos do mapa "p".
            */
-          class PitchShifter(sampleRate: Int, windowMs: Int = 50) {
-              private val w = sampleRate * windowMs / 1000
-              private val buf = FloatArray(w * 4)
-              private var wp = 0
-              private var phase = 0f
-              var ratio = 1f
+          object Pipeline {
 
-              fun process(x: Float): Float {
-                  buf[wp] = x
-                  phase += (1f - ratio) / w
-                  if (phase >= 1f) phase -= 1f
-                  if (phase < 0f) phase += 1f
-                  val p2 = (phase + 0.5f) % 1f
-                  val y = tap(phase) * gain(phase) + tap(p2) * gain(p2)
-                  wp = (wp + 1) % buf.size
-                  return y
-              }
+              private val WARP_IDS = listOf(
+                  "faceSlim", "chin", "eyes", "nose", "smile", "headSmall",
+                  "bodySlim", "waist", "legLong", "legSlim"
+              )
 
-              private fun tap(p: Float): Float {
-                  var pos = wp - (p * w + 1f)
-                  if (pos < 0f) pos += buf.size
-                  val i = pos.toInt()
-                  val f = pos - i
-                  val a = buf[i % buf.size]
-                  val b = buf[(i + 1) % buf.size]
-                  return a + (b - a) * f
-              }
+              fun run(src: Bitmap, p: Map<String, Int>, lm: Landmarks?): Bitmap {
+                  fun v(id: String): Int = p[id] ?: 0
 
-              private fun gain(p: Float) = 1f - abs(2f * p - 1f)
-          }
-          REA_EOF_X
-          mkdir -p app/src/main/java/com/example/vozgrave
-          cat > app/src/main/java/com/example/vozgrave/Recorder.kt <<'REA_EOF_X'
-          package com.example.vozgrave
+                  val w = src.width
+                  val h = src.height
+                  val faces = lm?.faces?.filter { it.outline.isNotEmpty() } ?: emptyList()
+                  val body = lm?.body
 
-          import android.annotation.SuppressLint
-          import android.media.AudioFormat
-          import android.media.AudioRecord
-          import android.media.MediaRecorder
-          import kotlin.math.max
+                  val anySkin = v("smooth") > 0 || v("whiten") > 0
+                  val anyMakeup = (v("lipstick") > 0 || v("blush") > 0) && faces.isNotEmpty()
+                  val anyColor = v("brightness") != 0 || v("contrast") != 0 ||
+                      v("saturation") != 0 || v("warmth") != 0 ||
+                      (v("filter") != 0 && v("fstrength") > 0)
+                  val anySharp = v("sharp") > 0
+                  val anyWarp = WARP_IDS.any { v(it) > 0 }
+                  if (!anySkin && !anyMakeup && !anyColor && !anySharp && !anyWarp) return src
 
-          /** Grava o microfone em memória (mono, 16 bits, 44,1 kHz). Limite: 5 minutos. */
-          class Recorder {
-              companion object {
-                  const val SR = 44100
-              }
+                  var px = IntArray(w * h)
+                  src.getPixels(px, 0, w, 0, 0, w, h)
 
-              @Volatile private var recording = false
-              private var thread: Thread? = null
-              private var data = ShortArray(SR * 10)
-              private var len = 0
-
-              @SuppressLint("MissingPermission")
-              fun start(): Boolean {
-                  val minBuf = AudioRecord.getMinBufferSize(
-                      SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-                  )
-                  if (minBuf <= 0) return false
-                  val rec = AudioRecord(
-                      MediaRecorder.AudioSource.MIC, SR,
-                      AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                      max(minBuf, SR)
-                  )
-                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                      rec.release()
-                      return false
+                  if (anySkin) {
+                      val mask = if (faces.isNotEmpty()) ImageOps.faceMask(w, h, faces) else null
+                      if (v("smooth") > 0) ImageOps.smoothSkin(px, w, h, mask, v("smooth") / 100f)
+                      if (v("whiten") > 0) ImageOps.whiten(px, mask, v("whiten") / 100f)
                   }
-                  len = 0
-                  recording = true
-                  thread = Thread {
-                      val buf = ShortArray(2048)
-                      rec.startRecording()
-                      while (recording && len < SR * 300) {
-                          val n = rec.read(buf, 0, buf.size)
-                          if (n > 0) {
-                              ensure(n)
-                              System.arraycopy(buf, 0, data, len, n)
-                              len += n
-                          } else if (n < 0) break
+
+                  if (anyMakeup || anyColor) {
+                      var bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                      bmp.setPixels(px, 0, w, 0, 0, w, h)
+                      if (anyMakeup) ImageOps.makeup(bmp, faces, v("lipstick"), v("blush"))
+                      if (anyColor) {
+                          val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                          val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+                          paint.colorFilter = ColorMatrixColorFilter(
+                              ImageOps.colorMatrix(
+                                  v("brightness"), v("contrast"), v("saturation"), v("warmth"),
+                                  v("filter"), v("fstrength")
+                              )
+                          )
+                          Canvas(out).drawBitmap(bmp, 0f, 0f, paint)
+                          bmp.recycle()
+                          bmp = out
                       }
-                      runCatching { rec.stop() }
-                      rec.release()
-                  }.also { it.start() }
-                  return true
+                      bmp.getPixels(px, 0, w, 0, 0, w, h)
+                      bmp.recycle()
+                  }
+
+                  if (anySharp) ImageOps.sharpen(px, w, h, v("sharp") / 100f * 1.5f)
+
+                  if (anyWarp) {
+                      val field = WarpField(w, h)
+                      addFaceWarps(field, faces, p)
+                      addBodyWarps(field, body, p, w, h)
+                      if (field.used) px = field.apply(px)
+                  }
+
+                  val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  result.setPixels(px, 0, w, 0, 0, w, h)
+                  return result
               }
 
-              fun stop(): ShortArray {
-                  recording = false
-                  thread?.join()
-                  thread = null
-                  return data.copyOf(len)
+              private fun addFaceWarps(f: WarpField, faces: List<FaceData>, p: Map<String, Int>) {
+                  val slim = (p["faceSlim"] ?: 0) / 100f
+                  val chin = (p["chin"] ?: 0) / 100f
+                  val eyes = (p["eyes"] ?: 0) / 100f
+                  val nose = (p["nose"] ?: 0) / 100f
+                  val smile = (p["smile"] ?: 0) / 100f
+                  val head = (p["headSmall"] ?: 0) / 100f
+
+                  for (face in faces) {
+                      val b = face.bounds
+                      val cx = b.exactCenterX()
+                      val cy = b.exactCenterY()
+                      val fw = b.width().toFloat()
+                      val fh = b.height().toFloat()
+
+                      if (slim > 0f) {
+                          for (pt in face.outline) {
+                              if (pt.y > cy) {
+                                  f.addPush(pt.x, pt.y, fw * 0.22f, fw * 0.22f, (cx - pt.x) * 0.12f * slim, 0f)
+                              }
+                          }
+                      }
+                      if (chin > 0f) {
+                          val bottom = face.outline.maxByOrNull { it.y }
+                          if (bottom != null) {
+                              f.addPush(bottom.x, bottom.y, fw * 0.30f, fw * 0.30f, 0f, -fh * 0.10f * chin)
+                          }
+                      }
+                      if (eyes > 0f) {
+                          for (eye in listOf(face.leftEye, face.rightEye)) {
+                              if (eye.size < 3) continue
+                              val ex = eye.map { it.x }.average().toFloat()
+                              val ey = eye.map { it.y }.average().toFloat()
+                              val ew = eye.maxOf { it.x } - eye.minOf { it.x }
+                              f.addBulge(ex, ey, ew * 1.4f, ew * 1.4f, 0.45f * eyes)
+                          }
+                      }
+                      if (nose > 0f && face.noseBottom.size >= 2) {
+                          val a = face.noseBottom.first()
+                          val z = face.noseBottom.last()
+                          val mid = (a.x + z.x) / 2f
+                          val nw = abs(z.x - a.x)
+                          for (pt in listOf(a, z)) {
+                              f.addPush(pt.x, pt.y, nw * 0.9f, nw * 0.9f, (mid - pt.x) * 0.35f * nose, 0f)
+                          }
+                      }
+                      val ml = face.mouthLeft
+                      val mr = face.mouthRight
+                      if (smile > 0f && ml != null && mr != null) {
+                          val mw = abs(mr.x - ml.x)
+                          for (pt in listOf(ml, mr)) {
+                              f.addPush(pt.x, pt.y, mw * 0.5f, mw * 0.5f, 0f, -mw * 0.12f * smile)
+                          }
+                      }
+                      if (head > 0f) {
+                          f.addBulge(cx, cy - fh * 0.1f, fw * 1.1f, fh * 1.1f, -0.25f * head)
+                      }
+                  }
               }
 
-              private fun ensure(n: Int) {
-                  if (len + n > data.size) data = data.copyOf(max(data.size * 2, len + n))
+              private fun lerp(a: PointF, b: PointF, t: Float) =
+                  PointF(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+
+              private fun addBodyWarps(f: WarpField, body: BodyData?, p: Map<String, Int>, w: Int, h: Int) {
+                  if (body == null) return
+                  val slim = (p["bodySlim"] ?: 0) / 100f
+                  val waist = (p["waist"] ?: 0) / 100f
+                  val legLong = (p["legLong"] ?: 0) / 100f
+                  val legSlim = (p["legSlim"] ?: 0) / 100f
+
+                  val ls = body.leftShoulder
+                  val rs = body.rightShoulder
+                  val lh = body.leftHip
+                  val rh = body.rightHip
+                  val shMid = lerp(ls, rs, 0.5f)
+                  val hipMid = lerp(lh, rh, 0.5f)
+                  val sw = abs(ls.x - rs.x)
+                  val torsoH = hypot(hipMid.x - shMid.x, hipMid.y - shMid.y)
+                  if (sw < 10f || torsoH < 10f) return
+
+                  if (slim > 0f) {
+                      for (t in listOf(0.25f, 0.45f, 0.65f, 0.85f)) {
+                          val c = lerp(shMid, hipMid, t)
+                          for (side in listOf(-1f, 1f)) {
+                              f.addPush(
+                                  c.x + side * sw * 0.42f, c.y, sw * 0.30f, torsoH * 0.22f,
+                                  -side * sw * 0.42f * 0.30f * slim, 0f
+                              )
+                          }
+                      }
+                  }
+                  if (waist > 0f) {
+                      val c = lerp(shMid, hipMid, 0.62f)
+                      for (side in listOf(-1f, 1f)) {
+                          f.addPush(
+                              c.x + side * sw * 0.40f, c.y, sw * 0.32f, torsoH * 0.25f,
+                              -side * sw * 0.40f * 0.40f * waist, 0f
+                          )
+                      }
+                  }
+                  if (legSlim > 0f) {
+                      val legs = listOf(
+                          Triple(lh, body.leftKnee, body.leftAnkle),
+                          Triple(rh, body.rightKnee, body.rightAnkle)
+                      )
+                      for ((hip, knee, ankle) in legs) {
+                          if (knee == null || ankle == null) continue
+                          val spots = listOf(
+                              lerp(hip, knee, 0.3f) to sw * 0.17f,
+                              lerp(hip, knee, 0.7f) to sw * 0.14f,
+                              lerp(knee, ankle, 0.3f) to sw * 0.12f,
+                              lerp(knee, ankle, 0.7f) to sw * 0.09f
+                          )
+                          for ((c, half) in spots) {
+                              for (side in listOf(-1f, 1f)) {
+                                  f.addPush(
+                                      c.x + side * half, c.y, sw * 0.16f, sw * 0.30f,
+                                      -side * half * 0.4f * legSlim, 0f
+                                  )
+                              }
+                          }
+                      }
+                  }
+                  if (legLong > 0f) {
+                      val y0 = hipMid.y + torsoH * 0.10f
+                      f.addStretchBelow(y0, 1f + 0.22f * legLong, h * 0.10f)
+                  }
               }
           }
           REA_EOF_X
-          mkdir -p app/src/main/java/com/example/vozgrave
-          cat > app/src/main/java/com/example/vozgrave/VoiceDeepener.kt <<'REA_EOF_X'
-          package com.example.vozgrave
+          mkdir -p app/src/main/java/com/example/retoque
+          cat > app/src/main/java/com/example/retoque/WarpField.kt <<'REA_EOF_X'
+          package com.example.retoque
 
-          import java.io.File
-          import java.nio.ByteBuffer
-          import java.nio.ByteOrder
-          import kotlin.math.PI
-          import kotlin.math.abs
-          import kotlin.math.cos
           import kotlin.math.max
           import kotlin.math.min
-          import kotlin.math.pow
-          import kotlin.math.sqrt
 
           /**
-           * Deixa a voz mais grave mantendo a duração (processamento offline, melhor qualidade).
-           * 1) Comprime o tempo com WSOLA (sem mudar o tom).
-           * 2) Reproduz mais devagar (reamostragem), o que baixa o tom e devolve a duração original.
+           * Campo de deformação (liquify). Todas as deformações somam seus deslocamentos
+           * e a imagem é reamostrada uma única vez no final (sem perder nitidez).
            */
-          object VoiceDeepener {
+          class WarpField(private val w: Int, private val h: Int) {
+              private val ox = FloatArray(w * h)
+              private val oy = FloatArray(w * h)
+              var used = false
+                  private set
 
-              fun process(input: ShortArray, semitonesDown: Float): ShortArray {
-                  val r = 2.0.pow(-semitonesDown / 12.0) // < 1
-                  val x = FloatArray(input.size) { input[it] / 32768f }
-                  val compressed = wsola(x, r)
-                  val out = resample(compressed, r)
-
-                  var peak = 0f
-                  for (v in out) {
-                      val a = abs(v)
-                      if (a > peak) peak = a
-                  }
-                  val gain = if (peak > 0.0001f) min(0.9f / peak, 3f) else 1f
-                  return ShortArray(out.size) {
-                      (out[it] * gain * 32767f).coerceIn(-32768f, 32767f).toInt().toShort()
-                  }
-              }
-
-              private fun wsola(x: FloatArray, alpha: Double): FloatArray {
-                  val n = 2048
-                  val hs = n / 2
-                  val delta = 512
-                  val ha = hs / alpha
-                  val targetLen = (x.size * alpha).toInt()
-                  val xp = FloatArray(x.size + 4 * n)
-                  System.arraycopy(x, 0, xp, 0, x.size)
-                  val out = FloatArray(targetLen + 2 * n)
-                  val win = FloatArray(n) { (0.5 - 0.5 * cos(2.0 * PI * it / n)).toFloat() }
-
-                  // primeiro quadro: metade inicial sem janela para não ter "fade-in"
-                  for (i in 0 until hs) out[i] += xp[i]
-                  for (i in hs until n) out[i] += win[i] * xp[i]
-
-                  var prev = 0
-                  var k = 1
-                  while (true) {
-                      val nominal = (k * ha).toInt()
-                      if (nominal >= x.size || k * hs + n > out.size) break
-                      val tpl = prev + hs
-                      val lo = max(0, nominal - delta)
-                      val hi = nominal + delta
-                      var best = lo
-                      var bestScore = -Float.MAX_VALUE
-                      var c = lo
-                      while (c <= hi) {
-                          var dot = 0f
-                          var en = 1e-6f
-                          var i = 0
-                          while (i < hs) {
-                              val a = xp[c + i]
-                              dot += a * xp[tpl + i]
-                              en += a * a
-                              i += 4
+              /** Empurra o conteúdo do ponto (cx,cy) pelo vetor (mx,my), com queda suave até a borda da elipse. */
+              fun addPush(cx: Float, cy: Float, rx: Float, ry: Float, mx: Float, my: Float) {
+                  if (rx < 1f || ry < 1f) return
+                  used = true
+                  val x0 = max(0, (cx - rx).toInt())
+                  val x1 = min(w - 1, (cx + rx).toInt())
+                  val y0 = max(0, (cy - ry).toInt())
+                  val y1 = min(h - 1, (cy + ry).toInt())
+                  for (y in y0..y1) {
+                      val ny = (y - cy) / ry
+                      for (x in x0..x1) {
+                          val nx = (x - cx) / rx
+                          val d2 = nx * nx + ny * ny
+                          if (d2 < 1f) {
+                              val f = 1f - d2
+                              val k = f * f
+                              val i = y * w + x
+                              ox[i] -= mx * k
+                              oy[i] -= my * k
                           }
-                          val score = dot / sqrt(en)
-                          if (score > bestScore) {
-                              bestScore = score
-                              best = c
-                          }
-                          c += 2
                       }
-                      val base = k * hs
-                      for (i in 0 until n) out[base + i] += win[i] * xp[best + i]
-                      prev = best
-                      k++
                   }
-                  return out.copyOf(targetLen)
               }
 
-              private fun resample(x: FloatArray, step: Double): FloatArray {
-                  val len = (x.size / step).toInt()
-                  val out = FloatArray(len)
-                  for (i in 0 until len) {
-                      val pos = i * step
-                      val j = pos.toInt()
-                      val f = (pos - j).toFloat()
-                      val a = x[j]
-                      val b = if (j + 1 < x.size) x[j + 1] else a
-                      out[i] = a + (b - a) * f
+              /** s > 0 aumenta a região; s < 0 diminui. */
+              fun addBulge(cx: Float, cy: Float, rx: Float, ry: Float, s: Float) {
+                  if (rx < 1f || ry < 1f) return
+                  used = true
+                  val x0 = max(0, (cx - rx).toInt())
+                  val x1 = min(w - 1, (cx + rx).toInt())
+                  val y0 = max(0, (cy - ry).toInt())
+                  val y1 = min(h - 1, (cy + ry).toInt())
+                  for (y in y0..y1) {
+                      val ny = (y - cy) / ry
+                      for (x in x0..x1) {
+                          val nx = (x - cx) / rx
+                          val d2 = nx * nx + ny * ny
+                          if (d2 < 1f) {
+                              val f = 1f - d2
+                              val k = s * f * f
+                              val i = y * w + x
+                              ox[i] += (cx - x) * k
+                              oy[i] += (cy - y) * k
+                          }
+                      }
+                  }
+              }
+
+              /** Estica verticalmente tudo que está abaixo de y0 (usado para alongar as pernas). */
+              fun addStretchBelow(y0: Float, k: Float, ramp: Float) {
+                  if (k <= 1f || ramp < 1f) return
+                  used = true
+                  for (y in 0 until h) {
+                      val fy = y.toFloat()
+                      if (fy <= y0) continue
+                      val t = ((fy - y0) / ramp).coerceIn(0f, 1f)
+                      val wgt = t * t * (3f - 2f * t)
+                      val off = -wgt * (fy - y0) * (1f - 1f / k)
+                      val row = y * w
+                      for (x in 0 until w) oy[row + x] += off
+                  }
+              }
+
+              fun apply(src: IntArray): IntArray {
+                  val out = IntArray(w * h)
+                  for (y in 0 until h) {
+                      for (x in 0 until w) {
+                          val i = y * w + x
+                          val dx = ox[i]
+                          val dy = oy[i]
+                          out[i] = if (dx == 0f && dy == 0f) src[i] else sample(src, x + dx, y + dy)
+                      }
                   }
                   return out
               }
-          }
 
-          object WavWriter {
-              fun write(file: File, pcm: ShortArray, sampleRate: Int) {
-                  val bytes = pcm.size * 2
-                  val bb = ByteBuffer.allocate(44 + bytes).order(ByteOrder.LITTLE_ENDIAN)
-                  bb.put("RIFF".toByteArray())
-                  bb.putInt(36 + bytes)
-                  bb.put("WAVE".toByteArray())
-                  bb.put("fmt ".toByteArray())
-                  bb.putInt(16)
-                  bb.putShort(1)   // PCM
-                  bb.putShort(1)   // mono
-                  bb.putInt(sampleRate)
-                  bb.putInt(sampleRate * 2)
-                  bb.putShort(2)
-                  bb.putShort(16)
-                  bb.put("data".toByteArray())
-                  bb.putInt(bytes)
-                  for (s in pcm) bb.putShort(s)
-                  file.writeBytes(bb.array())
+              private fun sample(src: IntArray, x: Float, y: Float): Int {
+                  val xf = x.coerceIn(0f, w - 1.001f)
+                  val yf = y.coerceIn(0f, h - 1.001f)
+                  val x0 = xf.toInt()
+                  val y0 = yf.toInt()
+                  val fx = xf - x0
+                  val fy = yf - y0
+                  val a = src[y0 * w + x0]
+                  val b = src[y0 * w + x0 + 1]
+                  val c = src[(y0 + 1) * w + x0]
+                  val d = src[(y0 + 1) * w + x0 + 1]
+                  return (0xFF shl 24) or
+                      (mix(a, b, c, d, fx, fy, 16) shl 16) or
+                      (mix(a, b, c, d, fx, fy, 8) shl 8) or
+                      mix(a, b, c, d, fx, fy, 0)
+              }
+
+              private fun mix(a: Int, b: Int, c: Int, d: Int, fx: Float, fy: Float, s: Int): Int {
+                  val ca = (a shr s) and 255
+                  val cb = (b shr s) and 255
+                  val cc = (c shr s) and 255
+                  val cd = (d shr s) and 255
+                  val top = ca + (cb - ca) * fx
+                  val bot = cc + (cd - cc) * fx
+                  return (top + (bot - top) * fy + 0.5f).toInt()
               }
           }
           REA_EOF_X
           mkdir -p app/src/main/res/layout
           cat > app/src/main/res/layout/activity_main.xml <<'REA_EOF_X'
           <?xml version="1.0" encoding="utf-8"?>
-          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent"
               android:layout_height="match_parent"
-              android:fillViewport="true">
+              android:background="#121212"
+              android:orientation="vertical">
+
+              <FrameLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1">
+
+                  <ImageView
+                      android:id="@+id/img"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent"
+                      android:scaleType="fitCenter" />
+
+                  <TextView
+                      android:id="@+id/hint"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_gravity="center"
+                      android:padding="24dp"
+                      android:text="Toque em ABRIR para escolher uma foto"
+                      android:textColor="#FFFFFF"
+                      android:textSize="16sp" />
+              </FrameLayout>
+
+              <TextView
+                  android:id="@+id/info"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:paddingStart="12dp"
+                  android:paddingTop="4dp"
+                  android:paddingEnd="12dp"
+                  android:textColor="#BBBBBB"
+                  android:textSize="12sp" />
+
+              <HorizontalScrollView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:scrollbars="none">
+
+                  <LinearLayout
+                      android:id="@+id/tabRow"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:orientation="horizontal" />
+              </HorizontalScrollView>
+
+              <ScrollView
+                  android:layout_width="match_parent"
+                  android:layout_height="210dp">
+
+                  <LinearLayout
+                      android:id="@+id/toolBox"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical"
+                      android:padding="12dp" />
+              </ScrollView>
 
               <LinearLayout
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:orientation="vertical"
-                  android:padding="24dp">
-
-                  <TextView
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:text="Voz Grave"
-                      android:textSize="28sp"
-                      android:textStyle="bold" />
-
-                  <TextView
-                      android:id="@+id/txtGrave"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="16dp"
-                      android:text="Quão grave: 4 semitons"
-                      android:textSize="16sp" />
-
-                  <SeekBar
-                      android:id="@+id/seekGrave"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:max="11"
-                      android:progress="3" />
-
-                  <TextView
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="24dp"
-                      android:text="1) Gravar e converter"
-                      android:textSize="18sp"
-                      android:textStyle="bold" />
-
-                  <TextView
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:text="Grave, ouça o resultado e envie o áudio pelo WhatsApp ou Telegram." />
+                  android:orientation="horizontal">
 
                   <Button
-                      android:id="@+id/btnRecord"
-                      android:layout_width="match_parent"
-                      android:layout_height="60dp"
-                      android:layout_marginTop="8dp"
-                      android:text="GRAVAR" />
+                      android:id="@+id/btnOpen"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="ABRIR" />
 
                   <Button
-                      android:id="@+id/btnPlay"
-                      android:layout_width="match_parent"
+                      android:id="@+id/btnCompare"
+                      android:layout_width="0dp"
                       android:layout_height="wrap_content"
-                      android:text="OUVIR" />
+                      android:layout_weight="1.4"
+                      android:text="ORIGINAL (SEGURE)" />
 
                   <Button
-                      android:id="@+id/btnShare"
-                      android:layout_width="match_parent"
+                      android:id="@+id/btnReset"
+                      android:layout_width="0dp"
                       android:layout_height="wrap_content"
-                      android:text="COMPARTILHAR" />
+                      android:layout_weight="1"
+                      android:text="ZERAR" />
 
                   <Button
-                      android:id="@+id/btnApply"
-                      android:layout_width="match_parent"
+                      android:id="@+id/btnSave"
+                      android:layout_width="0dp"
                       android:layout_height="wrap_content"
-                      android:text="CONVERTER DE NOVO COM O GRAU ATUAL" />
-
-                  <TextView
-                      android:id="@+id/txtStatus"
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="8dp"
-                      android:text="Pronto para gravar." />
-
-                  <TextView
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:layout_marginTop="32dp"
-                      android:text="2) Ao vivo (somente com fone)"
-                      android:textSize="18sp"
-                      android:textStyle="bold" />
-
-                  <TextView
-                      android:layout_width="match_parent"
-                      android:layout_height="wrap_content"
-                      android:text="Para ligações em outro aparelho: conecte um fone neste celular e encoste um dos lados no microfone do aparelho da ligação. Neste mesmo celular, o Android não deixa o app entrar na ligação do WhatsApp, Telegram ou Instagram." />
-
-                  <Button
-                      android:id="@+id/btnLive"
-                      android:layout_width="match_parent"
-                      android:layout_height="60dp"
-                      android:layout_marginTop="8dp"
-                      android:text="INICIAR AO VIVO" />
+                      android:layout_weight="1"
+                      android:text="SALVAR" />
               </LinearLayout>
-          </ScrollView>
-          REA_EOF_X
-          mkdir -p app/src/main/res/xml
-          cat > app/src/main/res/xml/file_paths.xml <<'REA_EOF_X'
-          <?xml version="1.0" encoding="utf-8"?>
-          <paths>
-              <cache-path name="audio" path="." />
-          </paths>
+          </LinearLayout>
           REA_EOF_X
           cat > build.gradle.kts <<'REA_EOF_X'
           plugins {
@@ -813,7 +1270,7 @@ jobs:
           }
           REA_EOF_X
           cat > gradle.properties <<'REA_EOF_X'
-          org.gradle.jvmargs=-Xmx2g
+          org.gradle.jvmargs=-Xmx3g
           android.useAndroidX=true
           kotlin.code.style=official
           REA_EOF_X
@@ -824,7 +1281,7 @@ jobs:
           dependencyResolutionManagement {
               repositories { google(); mavenCentral() }
           }
-          rootProject.name = "VozGrave"
+          rootProject.name = "Retoque"
           include(":app")
           REA_EOF_X
       - uses: actions/setup-java@v4
@@ -839,12 +1296,12 @@ jobs:
       - name: Guardar APK
         uses: actions/upload-artifact@v4
         with:
-          name: VozGrave-APK
+          name: Retoque-APK
           path: app/build/outputs/apk/debug/app-debug.apk
       - name: Publicar APK em Releases
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk VozGrave.apk
-          gh release create "vozgrave-${{ github.run_number }}" VozGrave.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Voz Grave APK #${{ github.run_number }}" --notes "APK de teste (debug)."
+          cp app/build/outputs/apk/debug/app-debug.apk Retoque.apk
+          gh release create "retoque-${{ github.run_number }}" Retoque.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Retoque APK #${{ github.run_number }}" --notes "APK de teste (debug)."
